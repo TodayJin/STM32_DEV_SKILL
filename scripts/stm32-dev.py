@@ -779,9 +779,15 @@ def cmd_flash(args):
     if not hexfile or not os.path.isfile(hexfile):
         print("ERROR: 找不到 hex 文件: %s" % hexfile)
         return 1
+    # ★ 两个 Sleep 不能删(坑#80)!
+    #   原来写的是 "loadfile ...\nr\ng\nexit\n": `g`(resume) 之后紧跟着 `exit`,
+    #   J-Link 会在 MCU 还没真正跑起来时关掉调试会话, 结果是 CPU 停在复位后的状态
+    #   —— 程序不跑, 串口/485 一个字都不回, 现象像是"烧完板子就死了"。
+    #   实测: `r g exit` = 0/24 应答; `r Sleep 1200 g Sleep 1200 exit` = 24/24。
+    #   四种写法 JLink 都不报错, 只能靠"烧完能不能通信"分辨。
     fd, script = tempfile.mkstemp(suffix=".jlink")
     with os.fdopen(fd, "w") as f:
-        f.write("loadfile %s\nr\ng\nexit\n" % hexfile.replace("\\", "/"))
+        f.write("loadfile %s\nr\nSleep 1200\ng\nSleep 1200\nexit\n" % hexfile.replace("\\", "/"))
     gui_before = _jlink_gui_pids()   # JLink.exe 退出会留下 JLinkGUIServer, 收尾要清
     rc = 1          # 默认按失败算, 只有确认成功才置 0
     try:
@@ -1514,7 +1520,9 @@ def cmd_verify(args):
 def cmd_reset(args):
     """复位并运行目标。"""
     dev = resolve_device(args, args.elf or infer_elf())
-    out = run_jlink_script(dev, ["r", "g", "q"])
+    # ★ `g` 与 `q` 之间必须有 Sleep(坑#80): 没 Sleep 时 J-Link 会在 MCU 还没跑起来
+    #   就关掉会话, 核停在复位态 —— 现象是"复位完串口/485 一点反应都没有"。
+    out = run_jlink_script(dev, ["r", "Sleep 1200", "g", "Sleep 1200", "q"])
     ok = "O.K." in out
     print("RESET+GO %s: %s" % (dev, "O.K." if ok else out[-300:]))
     return 0 if ok else 1
