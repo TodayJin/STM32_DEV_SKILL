@@ -4,15 +4,16 @@ description: |
   STM32 全流程开发技能：环境自检→编译→烧录→调试→发现问题→改代码→重烧→继续验证，
   循环直至功能正常才结束。基于 SEGGER J-Link + arm-none-eabi-gdb（不用 openocd），支持全系列
   STM32。含芯片自动识别、SVD 寄存器解码、自动烧录+刷后校验、观测手段分层（串口探针帧/RTT 上行/
-  RTT 下行/DWT 打点/故障现场转储/黑匣子）、22 个命令、--json 输出；附录 OBSERVE.md（观测手段）
+  RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查（`preflight`：拿技能里的结论把现有工程
+  扫一遍，机械项自动判、判不了的列人工清单）**、23 个命令、--json 输出；附录 OBSERVE.md（观测手段）
   PITFALLS.md（89 条实战坑）与 PRACTICES.md（工程实践手册：上电时序 / 协议从站 / 控制与标定 /
   状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）。
   适用前提：已有 GNU Make/CMake 工程，用 SEGGER J-Link + GDB 做板上诊断与验证
   （不负责 Keil/CubeIDE 工程生成，那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.15.0
-  date: 2026-10-05
+  version: 3.16.0
+  date: 2026-10-06
 ---
 
 # STM32 Dev Skill（全流程生命周期版）
@@ -34,10 +35,11 @@ metadata:
 
 | 章节 | 什么时候看 |
 |---|---|
+| ⛳ 开工前对照检查 | **接手任何已有工程的第一步**：`preflight` 拿技能里的结论把工程扫一遍（机械项自动判 + 人工清单） |
 | ⭐ 边改边测试 | **每次开工前必读**：一次只改一个变量 |
 | ✅ 调试正确姿势 | 铁律：调试器只做两件事、观测变量归属、寄存器纪律、**提问式排障（物理事实交给用户）**、**上电/标定/判定的安全默认态** |
 | 🚑 卡死急救 | 命令卡住/连不上/板子像死了 → 先 `cleanup` |
-| 🧰 技能自检 & 脚手架 | selftest / init-rtt / init-fault / verify |
+| 🧰 技能自检 & 脚手架 | preflight / selftest / init-rtt / init-fault / verify |
 | 🔬 观测手段分层 | 选哪种观测通道 + 通用集成法（RTT/DWT/故障转储/黑匣子） |
 | ①~⑨ 各阶段 | 具体命令（doctor/make/flash/read/rtt/blackbox…） |
 | 📋 案例复盘 | "串口收不到"一整天：错误的排查路径 |
@@ -48,12 +50,43 @@ metadata:
 ## 完整流程
 
 ```
-① doctor(环境自检) → ② make(编译) → ③ flash(烧录) → ④ 调试观察(发现问题)
-        ↓                                                      ↓
+⓿ preflight(开工前对照检查) → ① doctor(环境自检) → ② make(编译) → ③ flash(烧录) → ④ 调试观察(发现问题)
+                                                              ↓
 ⑨ 全通过=结束  ←  ⑧ 重新验证(读变量/复测)  ←  ⑦ 重烧  ←  ⑥ 改代码  ←  ⑤ 定位根因
 ```
 
 **循环直到**：所有目标功能验证通过、无残留问题、验收达成。
+
+---
+
+## ⛳ ⓿ 开工前对照检查（接手已有工程的第一步）
+
+**原则：先拿技能里的结论把「现有工程」扫一遍，再动手。** 这份技能里的坑，有一大半是「接手别人
+（或自己三个月前）的工程，上来就调，调了半天才发现地基是歪的」——省下的是「踩过了才想起来」那一遍。
+
+```bash
+python3 skills/stm32-dev/scripts/stm32-dev.py preflight            # 扫当前目录
+python3 .../stm32-dev.py preflight --root /path/to/project        # 指定工程
+python3 .../stm32-dev.py preflight --json                         # CI / 脚本里用
+```
+
+它分两半：
+
+**① 机械能判的，直接判掉（有 `[!!]` 就退出码 1，可进 CI）**
+
+| 检查 | 判据 | 坑 |
+|---|---|---|
+| 烧录/复位脚本 | `r` 与 `g` 之间、`g` 与 `exit` 之间必须有 `Sleep`（Makefile 里塞在一个 `printf "…\n"` 中的也算） | #80 / #22 |
+| 故障处理器 | `HardFault/MemManage/BusFault/UsageFault` 不能只有 `while(1)`，要有 printf / RTT / 黑匣子 | #32 |
+| 看门狗 | 用了 `HAL_IWDG_Init` 就必须有 `__HAL_DBGMCU_FREEZE_IWDG/WWDG`（否则一进断点就被狗咬复位） | #59 |
+| 观测通道 | `.noinit` 段 / `g_bb` / RTT / 收发计数器 / 只读 `DBG_*` 寄存器，缺哪些列哪些 | OBSERVE.md |
+
+**② 机械扫不出来的，列成人工清单**（`[ ]` 逐条对过）：请求队列是应答驱动还是发出即出队（#81）、
+读回来的值有没有做合理性检查（#82/#83）、寄存器单位查过手册没有（#84）、SRAM/EPROM 双寄存器与写锁
+（#85）、门卫条件互锁与派生状态缓存（#86/#87）、切模式的参数/模式书写顺序（#88）、模拟量零点标定入口
+（#89）、中断共享变量的 volatile/临界区（#57/#58）、偶发现象的黑匣子是否就绪（#32）。
+
+**这一步只读，不改任何东西。** 扫完再决定先修哪个——先修地基，别先修症状。
 
 ---
 
@@ -320,12 +353,16 @@ make flash             # 重烧
 ## 🧰 技能自检 & 脚手架（把方法变成可执行）
 
 ```bash
+"$SKILL/scripts/stm32-dev.py" preflight                            # ★开工第一步: 对照技能扫现有工程
 "$SKILL/scripts/stm32-dev.py" selftest --elf build/test.elf   # 无硬件自检技能自身机制
 "$SKILL/scripts/stm32-dev.py" init-rtt   --dir .              # 把 SEGGER RTT 源码放进工程
 "$SKILL/scripts/stm32-dev.py" init-fault --dir .              # 生成故障转储+黑匣子代码
 "$SKILL/scripts/stm32-dev.py" verify     --elf build/test.elf # 板子固件 vs ELF 一致性
 "$SKILL/scripts/stm32-dev.py" cleanup                         # 清残留 J-Link 进程
 ```
+- **`preflight`**：**接手任何已有工程的第一步**。扫 `Makefile`/`.jlink`/CI 里的烧录脚本（#80）、故障处理器
+  有没有现场记录（#32）、看门狗有没有调试冻结（#59）、观测通道齐不齐（OBSERVE.md），再列出 9 条机械扫不出
+  来的人工对照项。**只读**；有 `[!!]` 就退出码 1，可直接进 CI。
 - **`selftest`**：不接板子也能跑，验证序列分析/模板生成/ELF 解析/工具定位是否正常（改过技能后先跑它）；
 - **`init-rtt`**：从 J-Link 安装目录复制 RTT 源码（新版安装包常不含 → 会提示官方仓库），并打印接线步骤；
 - **`init-fault`**：生成 `blackbox.c/h` + `fault_dump.c/h`（裸函数取异常帧、有限次自动复位、300ms 冲刷），并打印链接脚本/初始化顺序；
@@ -377,7 +414,7 @@ stm32-dev/
 ├── PRACTICES.md        (附录: 工程实践手册 —— 上电时序/协议从站/控制与标定/状态灯/台架/上位机/流程/硬件板级)
 ├── CHANGELOG.md        (版本演进)
 └── scripts/
-    └── stm32-dev.py    (单文件引擎, 22 个命令, 仅标准库*; --json 输出)
+    └── stm32-dev.py    (单文件引擎, 23 个命令, 仅标准库*; --json 输出)
 ```
 
 * 仅 `rtt-send` 需要可选的 `pylink-square`（`pip install pylink-square`），其余命令只用标准库。
@@ -387,5 +424,5 @@ stm32-dev/
 rtt 没抓到数据、--check-seq 检出丢帧、build-verify 断言未满足、cleanup --all 缺 --force、
 识别不出芯片型号。--json 里的 ok 字段与退出码一致。
 
-命令：`doctor` `read` `write` `break` `continue` `step` `info` `attach` `start` `stop` `svd`
+命令：`preflight` `doctor` `read` `write` `break` `continue` `step` `info` `attach` `start` `stop` `svd`
 `flash` `verify` `reset` `rtt` `rtt-send` `blackbox` `init-rtt` `init-fault` `cleanup` `selftest` `build-verify`

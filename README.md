@@ -6,17 +6,17 @@
 
 ## 这是什么
 
-一个技能包（skill），把 STM32 板上调试的**流程、方法论、22 个命令、以及 89 条实战踩坑**固化下来。
+一个技能包（skill），把 STM32 板上调试的**流程、方法论、23 个命令、以及 89 条实战踩坑**固化下来。
 所有内容都来自真实板级调试，不是从手册转抄的。
 
 | 文件 | 内容 |
 |---|---|
-| `SKILL.md` | 主文件：九步流程 + **七条调试铁律** + 22 个命令用法 |
+| `SKILL.md` | 主文件：⓿ 开工前对照检查 + 九步流程 + **七条调试铁律** + 23 个命令用法 |
 | `OBSERVE.md` | 观测手段分层（串口探针帧 / RTT 上行 / RTT 下行 / DWT 打点 / 故障现场转储 / 黑匣子） |
 | `PITFALLS.md` | **89 条实战坑** + 按主题索引 —— 遇到怪现象先搜这里 |
 | `PRACTICES.md` | **工程实践手册**（正向）：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 / 可以直接抄的东西 / 已知缺口 |
 | `CHANGELOG.md` | 版本演进 |
-| `scripts/stm32-dev.py` | 单文件引擎，22 个命令，**仅标准库**，支持 `--json` |
+| `scripts/stm32-dev.py` | 单文件引擎，23 个命令，**仅标准库**，支持 `--json` |
 
 `PITFALLS.md` 记「怎么被坑」，`PRACTICES.md` 记「怎么做对」—— 两份互补。
 
@@ -38,13 +38,17 @@ git clone <repo-url> %USERPROFILE%\.dsh\skills\stm32-dev
 python scripts/stm32-dev.py selftest
 ```
 
-## 22 个命令
+## 23 个命令
 
 ```
-doctor  read   write  break  continue  step  info  attach  start  stop  svd
+preflight  doctor read   write  break  continue  step  info  attach  start  stop  svd
 flash   verify reset  rtt    rtt-send  blackbox  init-rtt  init-fault
 cleanup selftest  build-verify
 ```
+
+> **`preflight`** 是**接手任何已有工程的第一步**：拿这份技能里的结论把现有工程扫一遍 ——
+> 烧录脚本有没有 `r`/`g` 之间的 `Sleep`、故障处理器有没有现场记录、看门狗有没有调试冻结、
+> 观测通道齐不齐，再列 9 条机械扫不出来的人工对照项。**只读**，有 `[!!]` 退出码即 1，可进 CI。
 
 ## 适用前提
 
@@ -53,6 +57,13 @@ cleanup selftest  build-verify
 - 不负责 Keil / CubeIDE 工程生成（那属于 `stm32-development-workflow`）
 
 ## 版本
+
+**3.16.0**（2026-10-06）—— 新增 **`preflight` 命令 + ⓿ 开工前对照检查**：
+把这个技能本身变成**开工第一步的检查清单**。机械项自动判（烧录脚本 `r`/`g` 之间缺 `Sleep`、
+故障处理器只有 `while(1)`、看门狗没 `__HAL_DBGMCU_FREEZE_*`、观测通道缺失），
+机械扫不出来的列 9 条人工项。**只读**，有 `[!!]` 退出码即 1（可进 CI）。
+`SKILL.md` 新增「⛳ ⓿ 开工前对照检查」章节，`PRACTICES.md` §7 新增「接手已有工程」。
+命令数 22 → 23，坑数仍 89。
 
 **3.15.0**（2026-10-05）—— 新增坑 #80–#89：三条**把假象当根因**的静默故障
 （J-Link 脚本 `r`+`g` 后立刻 `exit` 把核留 halt → "烧完板子像死了"；请求队列"发出即出队"

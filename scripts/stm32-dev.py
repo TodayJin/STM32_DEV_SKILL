@@ -643,6 +643,262 @@ def cmd_doctor(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# preflight: 开工前, 拿技能里的结论把「现有工程」扫一遍
+#
+# 为什么单独一个命令: 这份技能里的坑, 有一大半是「接手别人/自己三个月前的工程,
+# 上来就调, 调到一半才发现地基是歪的」。机械能判的直接判掉, 判不了的列成
+# 人工对照清单 —— 省的是「踩过了才想起来」的那一遍。
+# ---------------------------------------------------------------------------
+_PF_SKIP_DIRS = {".git", "build", "Build", "out", "node_modules", "__pycache__",
+                 ".venv", "venv", ".dsh", ".idea", ".vscode"}
+_PF_TEXT_EXT = {".c", ".h", ".cpp", ".hpp", ".cc", ".mk", ".py", ".ps1", ".bat",
+                ".cmd", ".sh", ".jlink", ".ld", ".s", ".S", ".txt", ".cmake"}
+_PF_TEXT_NAME = {"Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "makefile.mk"}
+
+# 故障类 handler: 死循环 = 复现一次、现场全丢(坑 #32)。Error_Handler 不算 ——
+# CubeMX 生成的它就是 __disable_irq()+while(1), 报出来只会变成噪声。
+# NMI_Handler 也不算 —— CubeMX 同样生成 while(1), 且几乎不会是真实故障现场。
+_PF_FAULT_NAMES = ("HardFault_Handler", "MemManage_Handler", "BusFault_Handler",
+                   "UsageFault_Handler", "HardFault")
+
+# 机械扫不出来、但开工前必须人工逐条对过的(顺序 = 踩坑代价从高到低)
+_PF_MANUAL = [
+    ("#81", "设备请求队列是「应答驱动出队」还是「发出即出队」？",
+     "发送成功 != 应答成功。发出即出队时, 一次超时就让那条写**静默消失**。"
+     "修法: 收到合法应答才出队 + 重发/丢弃计数器(健康值 RETRY 小、DROP 恒 0)。"),
+    ("#82/#83", "读回来的数值有没有先做「合理性检查」再喂状态机？",
+     "判据: 厂商手册给的最大反馈值 < 该位宽上限 -> 高位是方向位/符号位。"
+     "块读必须拿「实际回读字节数」, 不够就不解析 —— 否则读的是未初始化栈。"),
+    ("#84", "每个寄存器/参数的单位, 都在手册里查过了吗？",
+     "典型: 速度寄存器单位是「50 步/秒 每 LSB」而不是步/秒; 直接写 200 等于请求 10000。"),
+    ("#85", "同一个功能有 SRAM / EPROM 两个寄存器吗？写之前要不要解锁？",
+     "典型: 0x10 最大扭矩(EPROM, 上电才生效) vs 0x30 转矩限制(SRAM, 立刻生效); 0x37 写锁。"),
+    ("#86/#87", "有没有「要 A 得先 B、要 B 得先 A」的门卫？派生状态被缓存了吗？",
+     "典型: 「要标定得先在用、要在用得先标定」-> 全新板子永远开不了头。"
+     "派生量(如「在用的轴数」)只在 Init 数一次, 后面全部读到陈旧值。"),
+    ("#88", "切换工作模式时, 是「参数先写、模式寄存器最后写」吗？目标先锁到当前实际位置了吗？",
+     "先写模式 -> 驱动器会拿上一次残留的目标参数立刻动一下。上电应该不动作。"),
+    ("#89", "力/力矩/电流这类模拟量的零点, 有现场标定入口并能持久化吗？",
+     "空载偏置(-437 g)不是「传感器就这样」, 是没标定。不标定, 力控模式全部偏。"),
+    ("#57/#58", "中断和主循环共享的变量, 都是 volatile / 有临界区保护吗？",
+     "单核也会烂: 主循环算一半被中断改掉、或读 64 位量读到半新半旧。"),
+    ("#32", "有没有「现象只出现一次」的偶发问题还没抓？",
+     "先确认黑匣子/故障记录能用, 再谈复现。死循环的 HardFault 等于没记录。"),
+]
+
+
+def _pf_iter_files(root, max_bytes=2 * 1024 * 1024):
+    """遍历 root 下值得扫的文本文件, yield (相对路径, 内容)。"""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _PF_SKIP_DIRS and not d.startswith(".")]
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1]
+            if ext not in _PF_TEXT_EXT and fn not in _PF_TEXT_NAME:
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(full) > max_bytes:
+                    continue
+                with io.open(full, "r", encoding="utf-8", errors="replace") as f:
+                    yield os.path.relpath(full, root), f.read()
+            except (OSError, IOError):
+                continue
+
+
+def _pf_flash_script_issues(text):
+    """扫 J-Link 脚本: r 与 g 之间、g 与 exit 之间必须有 Sleep(坑 #80)。
+
+    返回 [(行号, ['r','g',...], 说明)]。
+    Makefile/Python 里的脚本是「一个字符串 + \\n」, 所以先把字面 \\n 换成真换行,
+    再按行找命令。这样 `printf "loadfile X\\nr\\ng\\nexit\\n"` 也能被拆开看。
+    """
+    issues = []
+    s = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    lines = [l.strip() for l in s.splitlines()]
+    n = len(lines)
+    stop = ("exit", "qc", "q")
+    i = 0
+    while i < n:
+        if lines[i].lower() == "r":
+            j = i + 1
+            while j < n and lines[j].lower() not in ("g",) + stop:
+                j += 1
+            if j < n and lines[j].lower() == "g":
+                mid = [x for x in lines[i + 1:j] if x]
+                if not any(x.lower().startswith("sleep") for x in mid):
+                    issues.append((i + 1, ["r"] + mid + ["g"],
+                                   "r 与 g 之间没有 Sleep"))
+                k = j + 1
+                tail = []
+                while k < n:
+                    low = lines[k].lower()
+                    tail.append(lines[k])
+                    if low in stop or low.startswith("sleep"):
+                        break
+                    k += 1
+                if tail and tail[-1].lower() in stop:
+                    issues.append((j + 1, ["g"] + tail, "g 之后到 %s 之间没有 Sleep"
+                                   % tail[-1].lower()))
+                i = j + 1
+                continue
+        i += 1
+    return issues
+
+
+def _pf_iter_fault_handlers(text):
+    """yield (函数名, 函数体) —— 只挑「没有任何现场记录」的故障 handler。"""
+    pat = r"void\s+(%s)\s*\([^)]*\)\s*\{" % "|".join(_PF_FAULT_NAMES)
+    for m in re.finditer(pat, text):
+        depth, idx, body = 1, m.end(), []
+        while idx < len(text) and depth > 0:
+            ch = text[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            body.append(ch)
+            idx += 1
+        b = "".join(body)
+        has_log = re.search(r"(printf|SEGGER_RTT|RTT_|BlackBox|blackbox|g_bb|"
+                            r"fault_record|record_fault|BSP_Log|log_printf)", b)
+        if not has_log:
+            yield m.group(1), b
+
+
+def cmd_preflight(args):
+    """开工前: 拿技能里的结论, 把现有工程扫一遍。"""
+    root = os.path.abspath(args.root or ".")
+    print("=== 开工前对照检查: 现有工程 vs stm32-dev 技能 ===")
+    print("工程根目录: %s" % root)
+    if not os.path.isdir(root):
+        print("ERROR: 目录不存在: %s" % root)
+        return 1
+
+    bad = 0
+    flash_files, flash_issues = [], []
+    fault_found = []
+    wdg_files, has_freeze = [], False
+    has_noinit, has_bb, has_rtt = False, False, False
+    counter_files, diag_files = [], []
+
+    for rel, text in _pf_iter_files(root):
+        if "loadfile" in text or rel.lower().endswith(".jlink"):
+            iss = _pf_flash_script_issues(text)
+            if iss:
+                flash_files.append(rel)
+                for ln, seq, why in iss:
+                    flash_issues.append((rel, ln, why, " ".join(seq)))
+
+        for name, _body in _pf_iter_fault_handlers(text):
+            fault_found.append((rel, name))
+
+        if re.search(r"(HAL_IWDG_Init|HAL_WWDG_Init|IWDG->KR|WWDG->CR|\bHAL_IWDG_Refresh)", text):
+            wdg_files.append(rel)
+        if re.search(r"__HAL_DBGMCU_FREEZE_(IWDG|WWDG)", text):
+            has_freeze = True
+
+        if re.search(r"\.noinit\b", text):
+            has_noinit = True
+        if re.search(r"\bg_bb\b", text):
+            has_bb = True
+        if re.search(r"(SEGGER_RTT_|_SEGGER_RTT\b|RTT_printf)", text):
+            has_rtt = True
+        if re.search(r"(stat_rx_bytes|rx_frames|tx_frames|crc_err|rx_overrun|"
+                     r"tx_drop|ore_cnt|drop_cnt)", text):
+            counter_files.append(rel)
+        if re.search(r"\b(DIAG|DBG)_[A-Z][A-Z0-9_]*", text):
+            diag_files.append(rel)
+
+    # ---- 1) 烧录/复位脚本(机械可判定, 直接算失败) ----
+    print("--- 1. 烧录 / 复位脚本(坑 #80, #22) ---")
+    if flash_issues:
+        bad += 1
+        for rel, ln, why, seq in flash_issues:
+            print("  [!!] %s 第 %d 行附近: %s" % (rel, ln, why))
+            print("       序列: %s" % seq)
+        print("       修法: r 和 g 后面各补一行 Sleep 1200。")
+        print("             正确形态: loadfile <hex> / r / Sleep 1200 / g / Sleep 1200 / exit")
+        print("       根因: `g`(resume) 之后紧跟着 `exit`, J-Link 会在 MCU 还没真跑起来时")
+        print("             关掉调试会话, CPU 停在复位态 -> 对外总线一个字都不回,")
+        print("             现象像「烧完板子就死了」。* JLink 自己不会报任何错。")
+    else:
+        print("  [OK] 未发现 r/g/exit 缺 Sleep 的脚本")
+    print("       注意: 除 Makefile 外, CI / 上位机 / IDE 里的 .jlink 也要一起看。")
+
+    # ---- 2) 故障处理器 ----
+    print("--- 2. 故障处理器有没有现场记录(坑 #32) ---")
+    if fault_found:
+        bad += 1
+        for rel, name in fault_found:
+            print("  [!!] %s  %s() 只有死循环, 没有 printf / RTT / 黑匣子" % (rel, name))
+        print("       修法: python3 stm32-dev.py init-fault 生成 .noinit 黑匣子, 在 handler 里")
+        print("             记 CFSR/HFSR/PC/LR/SP; 退一步也要 RTT 打一句。")
+        print("       为什么: 死循环 = 复现一次、现场全丢, 只能靠猜。")
+    else:
+        print("  [OK] 未发现「只死循环」的故障处理器")
+
+    # ---- 3) 看门狗与调试冻结 ----
+    print("--- 3. 看门狗与调试冻结(坑 #59) ---")
+    if wdg_files and not has_freeze:
+        bad += 1
+        print("  [!!] 用了看门狗但项目里没有 __HAL_DBGMCU_FREEZE_IWDG/WWDG")
+        print("       涉及: %s" % ", ".join(sorted(set(wdg_files))[:6]))
+        print("       修法: 初始化里先 __HAL_RCC_DBGMCU_CLK_ENABLE(), 再")
+        print("             __HAL_DBGMCU_FREEZE_IWDG(); 否则一进断点就被狗咬复位,")
+        print("             看到的现象是「单步走着走着板子重启了」。")
+    elif wdg_files:
+        print("  [OK] 有看门狗且有调试冻结")
+    else:
+        print("  [--] 未发现看门狗(裸 Keil/Makefile 工程常见), 不需要冻结")
+
+    # ---- 4) 观测通道 ----
+    print("--- 4. 观测通道(OBSERVE.md) ---")
+    print("  [%s] 黑匣子 .noinit 段%s" % ("OK" if has_noinit else "--",
+          "" if has_noinit else "  (没有 -> 掉电/重启后上一轮的现场没了)"))
+    print("  [%s] 黑匣子变量 g_bb%s" % ("OK" if has_bb else "--", ""))
+    print("  [%s] RTT 打印%s" % ("OK" if has_rtt else "--",
+          "" if has_rtt else "  (三个 UART 全占时, 调试口只剩 RTT/SWD)"))
+    print("  [%s] 逐字节/逐帧计数器%s" % ("OK" if counter_files else "--",
+          "" if counter_files else "  (只有「帧数」分不清「没收到」和「收到解不出」)"))
+    print("  [%s] 只读诊断寄存器%s" % ("OK" if diag_files else "--", ""))
+    if not (has_rtt or counter_files):
+        print("       建议: 开工第一件事就是把这三件套建起来 —— RTT 打印 + 收发计数器")
+        print("             (rx_bytes / rx_frames / crc_err) + 几个只读 DBG 寄存器。")
+        print("             没有它们, 后面每一次「板子没反应」都要重新猜一遍。")
+
+    # ---- 5) 人工对照 ----
+    print("--- 5. 机械扫不出来、必须人工逐条对过的 ---")
+    for no, q, why in _PF_MANUAL:
+        print("  [ ] %-8s %s" % (no, q))
+        for line in _pf_wrap(why, 74):
+            print("            " + line)
+
+    # ---- 结论 ----
+    print("--- 结论 ---")
+    if bad:
+        print("  %d 项必须处理(上面 [!!])。改完再跑一次 preflight 确认清零。" % bad)
+        print("  技能全文: PITFALLS.md(89 条) / PRACTICES.md(正向手册) / OBSERVE.md(观测手段)")
+        return 1
+    print("  [OK] 机械项全过。请把上面 [ ] 的 9 条人工过一遍再动板子。")
+    print("  技能全文: PITFALLS.md(89 条) / PRACTICES.md(正向手册) / OBSERVE.md(观测手段)")
+    return 0
+
+
+def _pf_wrap(s, width):
+    """按宽度折行(中英文混排按字符数近似)。"""
+    out, cur = [], ""
+    for ch in s:
+        cur += ch
+        if len(cur) >= width or ch == "\n":
+            out.append(cur.rstrip())
+            cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+
 def cmd_read(args):
     elf = args.elf or infer_elf()
     if not elf:
@@ -779,7 +1035,7 @@ def cmd_flash(args):
     if not hexfile or not os.path.isfile(hexfile):
         print("ERROR: 找不到 hex 文件: %s" % hexfile)
         return 1
-    # ★ 两个 Sleep 不能删(坑#80)!
+    # * 两个 Sleep 不能删(坑#80)!
     #   原来写的是 "loadfile ...\nr\ng\nexit\n": `g`(resume) 之后紧跟着 `exit`,
     #   J-Link 会在 MCU 还没真正跑起来时关掉调试会话, 结果是 CPU 停在复位后的状态
     #   —— 程序不跑, 串口/485 一个字都不回, 现象像是"烧完板子就死了"。
@@ -1520,7 +1776,7 @@ def cmd_verify(args):
 def cmd_reset(args):
     """复位并运行目标。"""
     dev = resolve_device(args, args.elf or infer_elf())
-    # ★ `g` 与 `q` 之间必须有 Sleep(坑#80): 没 Sleep 时 J-Link 会在 MCU 还没跑起来
+    # * `g` 与 `q` 之间必须有 Sleep(坑#80): 没 Sleep 时 J-Link 会在 MCU 还没跑起来
     #   就关掉会话, 核停在复位态 —— 现象是"复位完串口/485 一点反应都没有"。
     out = run_jlink_script(dev, ["r", "Sleep 1200", "g", "Sleep 1200", "q"])
     ok = "O.K." in out
@@ -1599,6 +1855,37 @@ def cmd_selftest(args):
     chk("_parse_bool(false)", _parse_bool("$1 = false") is False)
     chk("_parse_bool(0/7)", _parse_bool("$1 = 0") is False and _parse_bool("$1 = 7") is True)
     chk("_parse_bool(乱码) -> None", _parse_bool("error") is None)
+
+    # 7b) preflight: 烧录脚本 r/g/exit 缺 Sleep 必须被检出(坑 #80)
+    bad_script = 'loadfile a.hex\nr\ng\nexit\n'
+    chk("preflight 检出 r/g/exit 全缺 Sleep",
+        len(_pf_flash_script_issues(bad_script)) == 2,
+        str(_pf_flash_script_issues(bad_script)))
+    good_script = 'loadfile a.hex\nr\nSleep 1200\ng\nSleep 1200\nexit\n'
+    chk("preflight 放过 r Sleep g Sleep exit",
+        len(_pf_flash_script_issues(good_script)) == 0,
+        str(_pf_flash_script_issues(good_script)))
+    # Makefile 形态: 命令全塞在一个 printf 的字面 \n 里, 也必须拆得开
+    mk = '@printf "loadfile $(H)\\nr\\ng\\nexit\\n" > flash.jlink\n'
+    chk("preflight 能拆开 Makefile 里的字面 \\n",
+        len(_pf_flash_script_issues(mk)) == 2, str(_pf_flash_script_issues(mk)))
+    chk("preflight 放过 r 与 g 之间有 Sleep 的 Makefile",
+        len(_pf_flash_script_issues(
+            mk.replace("\\nr\\ng\\nexit", "\\nr\\nSleep 1200\\ng\\nSleep 1200\\nexit"))) == 0)
+    chk("preflight r->g 与 g->exit 各报一条(无 loadfile 时由调用方过滤)",
+        len(_pf_flash_script_issues("r\ng\nexit\n")) == 2,
+        str(_pf_flash_script_issues("r\ng\nexit\n")))
+
+    # 7c) preflight: 只死循环的故障处理器必须被检出(坑 #32)
+    hf_dead = "void HardFault_Handler(void) {\n  while (1) {}\n}\n"
+    chk("preflight 检出死循环 HardFault",
+        [n for n, _ in _pf_iter_fault_handlers(hf_dead)] == ["HardFault_Handler"],
+        str([n for n, _ in _pf_iter_fault_handlers(hf_dead)]))
+    hf_log = "void HardFault_Handler(void) {\n  g_bb.cfsr = SCB->CFSR;\n  while (1) {}\n}\n"
+    chk("preflight 放过有现场记录的 HardFault",
+        list(_pf_iter_fault_handlers(hf_log)) == [])
+    chk("preflight 不管 CubeMX 的 Error_Handler",
+        list(_pf_iter_fault_handlers("void Error_Handler(void) {\n while (1) {}\n}\n")) == [])
 
     # 8) 型号识别失败必须报错, 不能猜
     class _N:
@@ -1984,6 +2271,11 @@ def build_parser():
     s = sub.add_parser("doctor"); add_common(s)
     s.set_defaults(func=cmd_doctor)
 
+    s = sub.add_parser("preflight", help="*开工第一步: 拿技能里的结论把现有工程扫一遍")
+    add_common(s)
+    s.add_argument("--root", default=None, help="工程根目录(默认当前目录)")
+    s.set_defaults(func=cmd_preflight)
+
     s = sub.add_parser("read"); add_common(s); s.add_argument("targets", nargs="+")
     s.add_argument("--keep-halted", action="store_true", help="读完后不恢复运行(默认会 monitor go)")
     s.set_defaults(func=cmd_read)
@@ -2081,6 +2373,14 @@ def build_parser():
 
 def main():
     global _JSON, _SERIAL
+    # Windows 控制台默认 GBK: 打印 -> / * / != 这类字符会直接 UnicodeEncodeError
+    # 把整个命令弄崩(而命令本身其实是对的)。统一降级成 replace —— 宁可显示成
+    # '?' 也不要命令失败。(坑 #8)
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except Exception:
+            pass
     args = build_parser().parse_args()
     _JSON = bool(getattr(args, "json", False))
     _SERIAL = getattr(args, "serial", "") or DEFAULT_SERIAL
