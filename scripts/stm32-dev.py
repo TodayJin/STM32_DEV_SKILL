@@ -194,15 +194,23 @@ def symbol_addr_from_elf(elf, name):
 def analyze_increasing_seq(text):
     """找出一条严格递增的数字列(如 seq=/tick=), 报告丢帧情况。
 
-    返回 (字段名, 样本数, 稳态最大跳变, 超步长次数, 开头追赶区最大跳变, 正常步长) 或 None。
+    返回 (字段名, 样本数, 稳态最大跳变, 超步长次数, 开头追赶区最大跳变, 正常步长, 分组说明)
+    或 None(没有像计数器的列)。分组说明只在"同一通道里有好几条同名序列"时非空。
+
+    为什么要按前缀分组: 同一个字段名可能来自【互不相干的两条序列】—— 例: 自报帧
+    `[IA] HB seq=12` 与 RTT 探针帧 `RTT seq=410` 都叫 seq。混成一条统计会得出
+    "稳态最大跳变 704" 这种假丢帧(实战踩过: 自报帧和 RTT 帧同抓一份日志)。
     """
     import re
-    cand = {}   # name -> [values]
+    cand = {}   # (前缀组, 字段名) -> [values]
     for line in text.splitlines():
-        for k, v in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=(\d+)", line):
-            cand.setdefault(k, []).append(int(v))
+        for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)=(\d+)", line):
+            k = m.group(1)
+            pre = line[:m.start()].strip()
+            grp = (pre.split()[-1] if pre else "")[:16]
+            cand.setdefault((grp, k), []).append(int(m.group(2)))
     best = None
-    for k, vals in cand.items():
+    for (grp, k), vals in cand.items():
         if len(vals) < 5:
             continue
         inc = sum(1 for a, b in zip(vals, vals[1:]) if b > a)
@@ -222,8 +230,15 @@ def analyze_increasing_seq(text):
         # 优先选"步长=1"的纯计数列(如 seq), 其次才看样本数
         score = (len(vals), 1 if med <= 1 else 0)
         if best is None or score > best[0]:
-            best = (score, k, len(vals), max(rest), gaps, max(lead), base)
-    return best[1:] if best else None
+            best = (score, grp, k, len(vals), max(rest), gaps, max(lead), base)
+    if best is None:
+        return None
+    _, grp, k, n, mx, gaps, lead, base = best
+    sibs = sorted("%s%s (%d 个)" % (g + " " if g else "", kk, len(v))
+                  for (g, kk), v in cand.items()
+                  if kk == k and (g, kk) != (grp, k) and len(v) >= 5)
+    note = ("同名序列还有: " + ", ".join(sibs[:4]) + " —— 已分开统计, 没混在一起") if sibs else ""
+    return (k, n, mx, gaps, lead, base, note)
 
 
 def find_python():
@@ -2053,9 +2068,11 @@ def _rtt_report(args, outfile, logfile=None, hints=None):
         if res is None:
             print("--check-seq: 没找到递增计数列(固件里最好带一个自增序号)")
         else:
-            k, n, mx, gaps, lead, base = res
+            k, n, mx, gaps, lead, base, note = res
             print("--check-seq: 字段 %s, %d 个样本, 正常步长 %d, 稳态最大跳变 %d, 超步长 %d 次 -> %s"
                   % (k, n, base, mx, gaps, "无丢帧" if gaps == 0 else "有丢帧/混入旧数据"))
+            if note:
+                print("            " + note)
             jset(seq_check={"field": k, "samples": n, "base_delta": base,
                             "max_delta": mx, "gaps": gaps, "ok": gaps == 0})
             if lead > 1:
@@ -2925,6 +2942,14 @@ def cmd_selftest(args):
     bad = good.replace("seq=25", "seq=40")
     res2 = analyze_increasing_seq(bad)
     chk("analyze_increasing_seq 能检出丢帧", res2 is not None and res2[3] >= 1, str(res2))
+    # 同一份日志里两条互不相干的同名序列(自报帧 + RTT 探针帧)不能混成一条统计
+    mixed = "\n".join(["RTT seq=%d tick=%d" % (i, i * 100) for i in range(1, 41)] +
+                       ["[IA] HB seq=%d t=%d" % (i, i * 2000) for i in range(1, 11)])
+    res3 = analyze_increasing_seq(mixed)
+    chk("analyze_increasing_seq 不把两条同名序列混在一起",
+        res3 is not None and res3[3] == 0, str(res3))
+    chk("analyze_increasing_seq 会提示同名序列有多条",
+        res3 is not None and "同名序列" in res3[6], str(res3[6]) if res3 else "")
     # 2) 模板生成
     d = tempfile.mkdtemp(prefix="stm32-dev-selftest-")
     d0 = d      # 后面退出码自检用同一个临时目录(里面没有 ELF)
@@ -5296,9 +5321,11 @@ def cmd_serial(args):
         if res is None:
             print("--check-seq: 没找到递增计数列。建议固件每帧带 seq=<自增数>, 这样丢帧可判定。")
         else:
-            k, n, mx, gaps, lead, base = res
+            k, n, mx, gaps, lead, base, note = res
             print("--check-seq: 字段 %s, %d 个样本, 正常步长 %d, 稳态最大跳变 %d, 超步长 %d 次 -> %s"
                   % (k, n, base, mx, gaps, "无丢帧" if gaps == 0 else "有丢帧"))
+            if note:
+                print("            " + note)
             jset(seq_check={"field": k, "samples": n, "base_delta": base,
                             "max_delta": mx, "gaps": gaps, "ok": gaps == 0})
             if lead > 1:

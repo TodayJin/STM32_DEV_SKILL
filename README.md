@@ -90,6 +90,8 @@ rtt-send blackbox init-rtt init-fault cleanup  selftest build-verify
 
 ## 版本
 
+**3.17.4**（2026-10-11）—— `--check-seq` 按序列来源分组：自报帧与 RTT 探针帧的同名 `seq=` 不再被混成一条（假丢帧）；
+OBSERVE.md 新增「自报帧的推荐格式」（序号/时间戳/结论码 + 让路·闭嘴·节奏三条安全规则 + 同一行镜像进 RTT 的验法）。
 **3.17.3**（2026-10-11）—— **ST-Link 真机全链路跑通**（ST-Link/V2 实机）：认出世代并按代给时钟，
 `flash` / `verify` / `reset` / `rtt` / `rtt-send` 在官方 CLI 与 OpenOCD 两条路上全部真机验过；
 官方 CLI 用不了时自动改走 OpenOCD 并记住这只探针；新增 `--via auto|cli|openocd` 与 `--freq`。
