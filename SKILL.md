@@ -2,25 +2,28 @@
 name: stm32-dev
 description: |
   STM32 全流程开发技能：环境自检→编译→烧录→调试→发现问题→改代码→重烧→继续验证，
-  循环直至功能正常才结束。基于 SEGGER J-Link + arm-none-eabi-gdb（不用 openocd），支持全系列
-  STM32。含芯片自动识别、SVD 寄存器解码、自动烧录+刷后校验、观测手段分层（串口探针帧/RTT 上行/
-  RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查（`preflight`：拿技能里的结论把现有工程
-  扫一遍，机械项自动判、判不了的列人工清单）**、23 个命令、--json 输出；附录 OBSERVE.md（观测手段）
-  PITFALLS.md（89 条实战坑）与 PRACTICES.md（工程实践手册：上电时序 / 协议从站 / 控制与标定 /
-  状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）。
-  适用前提：已有 GNU Make/CMake 工程，用 SEGGER J-Link + GDB 做板上诊断与验证
-  （不负责 Keil/CubeIDE 工程生成，那属于 stm32-development-workflow）。
+  循环直至功能正常才结束。**调试器通用**：J-Link / ST-Link(V3) / DAPLink(CMSIS-DAP) 插哪个用哪个
+  （自动探测，能力与坑见 PROBES.md），全系列 STM32。含芯片自动识别、SVD 寄存器解码、自动烧录+刷后校验、
+  观测手段分层（串口探针帧/RTT 上行/RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查
+  （`preflight`：拿技能里的结论把现有工程扫一遍，机械项自动判、判不了的列人工清单）**、
+  空项目脚手架（`new`：自动搭 Makefile 工程 + 按调试器配好）、串口观测（`serial`）、27 个命令、
+  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（89 条实战坑）与 PRACTICES.md（工程实践手册：
+  上电时序 / 协议从站 / 控制与标定 / 状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）、
+  PROBES.md（三种调试器各自的坑 / 可用工具 / 最强用法 / 降级路径）、SETUP.md（工具链怎么装、装在哪）。
+  适用前提：已有 GNU Make/CMake 工程，或用 `new` 现场生成；不负责 Keil/CubeIDE 工程生成
+  （那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.16.0
-  date: 2026-10-06
+  version: 3.17.0
+  date: 2026-10-11
 ---
 
 # STM32 Dev Skill（全流程生命周期版）
 
 ## 概述
 一个**完整的 STM32 开发闭环**：环境自检 → 编译 → 烧录 → 调试 → 定位 → 改代码 → 重编译 → 重烧 → 继续验证，
-**循环到功能正常才结束**。不依赖 Keil/CubeIDE，不用 openocd（J-Link 驱动冲突）。
+**循环到功能正常才结束**。不依赖 Keil/CubeIDE；调试器用 J-Link / ST-Link / DAPLink 任意一种
+（默认自动探测，`probe use` 能写进工程固定下来；三种的区别与注意事项见 PROBES.md）。
 
 核心原则：**开发不是一次性的，是"发现-修复-重验"的循环**，直到验收标准达成才收尾。
 
@@ -58,6 +61,23 @@ metadata:
 **循环直到**：所有目标功能验证通过、无残留问题、验收达成。
 
 ---
+
+## 🔌 第 0 步：选调试器（`probe`）与建工程
+
+**新工程开工前先问一句**：`probe detect` 看插着哪个 → 用一句话把结论说给用户听（「发现的是 ST-Link V3；它最强的是烧录校验、选项字节和救砖，实时日志比 J-Link 慢」）→ 问「就用它吗」。用户手上还没有探针时，把三种的取舍讲清楚（PROBES.md 第 0 节）再让他挑。**只有用户明确说没有某个条件（例如板子没引出 SWO、只有 4 针 SWD）才降级**，否则一律按这台探针的最强能力配。选完 `probe use <名>` 写进工程，后面全自动。
+
+```bash
+"$SKILL/scripts/stm32-dev.py" probe list             # 三种调试器各自的能力 + 本机缺什么工具
+"$SKILL/scripts/stm32-dev.py" probe detect           # 插着的调试器认一认(带序列号)
+"$SKILL/scripts/stm32-dev.py" probe use stlink       # 用 ST-Link, 并写进工程配置 .stm32-dev.json(以后不用再指定)
+"$SKILL/scripts/stm32-dev.py" probe info stlink      # 这台调试器的能力/注意事项/最强用法/降级路径
+"$SKILL/scripts/stm32-dev.py" setup --fix            # 一键体检 + 能自动补的直接补(写探针配置 / pip 装 pyserial·pyocd)
+"$SKILL/scripts/stm32-dev.py" setup --install        # 还缺编译器/openocd 时连系统包也自动装(winget/apt)
+"$SKILL/scripts/stm32-dev.py" new --dir . --device STM32G431CBT6   # 空文件夹 -> 能直接 make/flash 的最小工程
+```
+
+**不用记这些**：插上哪个调试器技能就自动用哪个；配一次（写进工程）之后所有命令都走对的那条路。
+三种调试器的取舍、各自的坑、能用的额外工具 → **PROBES.md**；缺工具怎么装 → **SETUP.md**。
 
 ## ⛳ ⓿ 开工前对照检查（接手已有工程的第一步）
 
@@ -230,7 +250,7 @@ python3 .../stm32-dev.py preflight --json                         # CI / 脚本�
 ```bash
 "$SKILL/scripts/stm32-dev.py" doctor --elf build/test.elf     # $SKILL = 技能根目录(见文末目录结构)
 ```
-检测 J-Link/gdb/readelf/python3，识别芯片，定位 SVD，缺什么给指引。
+检测调试器（按探针：J-Link / ST-Link 官方 CLI / OpenOCD）、gdb、readelf、python3，识别芯片，定位 SVD，缺什么给指引。
 
 ## ② 编译
 
@@ -240,14 +260,17 @@ make clean && make  # 干净重编(改Makefile/源文件后)
 ```
 产物 `build/*.elf/.hex`。**调试前确认 ELF 最新**（否则旧固件值全垃圾）。
 
-## ③ 烧录（JLink.exe，不用 CubeProgrammer）
+## ③ 烧录（按调试器自动选路，不用你操心）
 
 ```bash
 # 方式1
 make flash    # 若工程已配
 # 方式2 (技能自带)
 "$SKILL/scripts/stm32-dev.py" flash --elf build/test.elf --device STM32H743VI
-# 底层: JLink.exe -device <DEV> -if SWD -speed 4000 -autoconnect 1 -CommanderScript flash.jlink
+# 底层按调试器走, 三种都不用图形界面(拿得到返回码):
+#   J-Link  -> JLink.exe -device <DEV> -if SWD -speed 4000 -autoconnect 1 -CommanderScript flash.jlink
+#   ST-Link -> STM32_Programmer_CLI -c "port=SWD freq=8000" -w <hex> -v -rst
+#   DAPLink -> openocd -f interface/cmsis-dap.cfg -f target/<系列>x.cfg -c "program <elf> verify reset exit"
 ```
 每改一次代码都要重烧，否则板子跑旧固件。
 
@@ -258,15 +281,32 @@ make flash    # 若工程已配
 或者根本没有 ELF 可比 —— `flash` 一律返回退出码 1（烧录本身可能成功了，但"没被验证过"）。
 确实不打算校验，必须显式写 `--no-verify`，那时才会打印 `VERIFY: 已按 --no-verify 跳过` 并返回 0。
 
+**第一次动接了执行器（电机/电缸）的板子，先加 `--dry-run`**：`flash --dry-run` / `reset --dry-run`
+只打印「将要执行的命令 + 技能给你选了哪条路」，板子一点都不碰（退出码 0）。确认无误再去掉它真执行。
+
+### 📡 串口观测（`serial`：不占调试器，换任何探针都一样用）
+```bash
+"$SKILL/scripts/stm32-dev.py" serial --port COM21 --seconds 5          # 读 5 秒
+"$SKILL/scripts/stm32-dev.py" serial --list                           # 列本机串口(自动挑最像目标板的一个)
+"$SKILL/scripts/stm32-dev.py" serial --port COM21 --grep "ERR|FAULT"  # 只看关心的行(没命中退出码=1)
+"$SKILL/scripts/stm32-dev.py" serial --port COM21 --check-seq --seconds 10   # 查自增序号有没有跳变(判丢帧)
+```
+串口是**唯一一条"不用调试器也能看运行现场"**的通道，可以和烧录/调试**同时**进行（调试器独占的是探针，不是串口）。
+固件里每帧带一个自增 `seq=` 最省事 —— 没序号就判不了丢帧（详见 OBSERVE.md 的串口探针帧）。
+
 ## ④ 调试观察
 
 ```bash
 "$SKILL/scripts/stm32-dev.py" read g_motor.enabled g_motor.mode   # 读变量
-"$SKILL/scripts/stm32-dev.py" read GPIOA.ODR                      # 读寄存器(gdb 表达式)
-"$SKILL/scripts/stm32-dev.py" read "*(uint32_t*)0x20000000"       # 读内存要写解引用表达式
+"$SKILL/scripts/stm32-dev.py" read 0xE000ED00 0xE0001000          # 读裸地址(内核/没有 SVD 的外设)
+"$SKILL/scripts/stm32-dev.py" read 0xE000ED00 --size 1            # --size 1/2/4/8 指宽度(默认 4)
+"$SKILL/scripts/stm32-dev.py" read "*(uint32_t*)0x20000000"       # gdb 表达式也行(符号名原样透传)
 "$SKILL/scripts/stm32-dev.py" write g_motor.enabled=1             # 写变量
-# read/write/info/break 默认读完后 `monitor go` 恢复运行(detach ≠ 恢复运行, 坑#16);
-# 想保持 halt 加 --keep-halted
+"$SKILL/scripts/stm32-dev.py" write 0xE000EDF0=0xA05F0003         # 写裸地址(例: DHCSR)
+# 常用裸地址: 0xE000ED00 CPUID / 0xE000ED28 CFSR / 0xE000EDF0 DHCSR
+#            0xE0001000 DWT_CTRL(bit0=1 才说明这芯片有 CYCCNT) / 0xE0001004 CYCCNT
+# read/write/info/break 默认读完后自动恢复运行(detach ≠ 恢复运行, 坑#16);
+# J-Link 发 `monitor go`, ST-Link/DAPLink 发 `monitor resume`(OpenOCD 没 go 这条命令); 想保持 halt 加 --keep-halted
 "$SKILL/scripts/stm32-dev.py" svd --elf build/test.elf GPIOA.MODER   # 读寄存器并用 SVD 解码位域
 "$SKILL/scripts/stm32-dev.py" verify --elf build/test.elf           # 校验板子固件 == ELF(坑#9); 不一致退出码=1
 "$SKILL/scripts/stm32-dev.py" reset --elf build/test.elf            # 复位+运行
@@ -283,13 +323,13 @@ make flash    # 若工程已配
 "$SKILL/scripts/stm32-dev.py" rtt --device STM32H743VI --address 0x20000768  # 手动指定控制块(默认已自动解析)
 ```
 `rtt` 的行为：
-- **地址自动解析**：从 ELF 符号 `_SEGGER_RTT` 取地址（比自动搜索快得多；自动搜索本机实测 10s+，窗口给小了会误判成"没数据"）；
-- **抓包前自动 `monitor go`**：避免"CPU 被 halt → 只抓到缓冲区快照"（行数 ≤2 时也会提示）；`--no-resume` 可关掉；
-- **`--check-seq`**：自动找出递增计数列并报告稳态最大跳变/丢帧次数（首段追赶不计）；
-- 与 GDB server 互斥，先 `stop`。
-```bash
-```
-RTT 控制块地址：`arm-none-eabi-nm <elf> | grep _SEGGER_RTT`。**与 GDB server 互斥**（同一台 J-Link 独占，先 `stop`）。
+- **按调试器自动选通道**：J-Link 走 `JLinkRTTLogger`；ST-Link / DAPLink 走 OpenOCD 的 `rtt setup` + `rtt start` + `rtt server start <端口> <通道>`（本地 TCP，默认端口 9090，`--rtt-port` 可改），抓完按 PID 收干净；
+- **地址先解析、抓空会自愈**：先取 ELF 符号 `_SEGGER_RTT` 的地址（最快最准）；**一条数据都没抓到**就自动改用 RAM 搜索（`0x20000000 0x20000`）再抓一次 —— 这通常意味着**板子跑的不是这份 ELF**（坑#9，符号地址属于别的构建）；也可以自己给 `--address` / `--search`；
+- **抓包前自动恢复运行**：避免"CPU 被 halt → 只抓到缓冲区快照"（行数 ≤2 时也会提示）；`--no-resume` 可关掉；
+- **`--check-seq`**：自动找出递增计数列并报告稳态最大跳变/丢帧次数（首段追赶不计）。
+- **下行（回灌）也能用**：`rtt-send --data "cmd\n"` —— J-Link 走 pylink 直连 DLL，ST-Link/DAPLink 走 OpenOCD 的 `rtt server`（**它是双向的**：往 socket 写 = 写目标的下行缓冲）。固件侧仍然要轮询 `SEGGER_RTT_HasKey()/GetKey()`。
+RTT 控制块地址：`arm-none-eabi-nm <elf> | grep _SEGGER_RTT`（技能默认已自动解析）。
+**互斥说明**：同一台探针同一时刻只能被一个程序独占 —— J-Link 的 `JLinkRTTLogger` 与 `JLinkGDBServerCL` 互斥（技能抓包前会自动 `stop`）；OpenOCD 的 RTT 与 GDB 服务在同一个进程里，不互斥。别的探针怎么抓观测通道见 PROBES.md。
 
 ### 🚑 卡死急救（第一反应就敲这个）
 ```bash
@@ -302,7 +342,7 @@ RTT 控制块地址：`arm-none-eabi-nm <elf> | grep _SEGGER_RTT`。**与 GDB se
 芯片识别：自动从 ELF 读。失败用 `--device <完整型号>`。
 
 ### ⚡ 性能优化：先 start 常驻再反复 read（关键）
-每命令默认会起/杀 JLinkGDBServerCL（约 1.7s），反复读变量很慢。**优化后**：
+每命令默认会起/杀 GDB server（J-Link 是 `JLinkGDBServerCL`、ST-Link/DAPLink 是 `OpenOCD`，约 1.7s），反复读变量很慢。**优化后**：
 ```bash
 "$SKILL/scripts/stm32-dev.py" start --device STM32H743VI   # 启动常驻 server(detached)
 "$SKILL/scripts/stm32-dev.py" read ... read ...            # 复用, 延迟 ~180ms(非1978ms)
@@ -313,7 +353,7 @@ RTT 控制块地址：`arm-none-eabi-nm <elf> | grep _SEGGER_RTT`。**与 GDB se
 - `stop` 按记录的 PID 清理。
 - **实测**：优化前 1978ms → 优化后 ~195ms（降约 10 倍）。
 
-- ⚠️ **多探针务必带 `--serial <S/N>`**：同时插两台 J-Link 时，不给串号就由 J-Link 自己挑 —— 可能这次 read 打在 A 板、
+- ⚠️ **多探针务必带 `--serial <S/N>`**：同时插两台同型号探针时，不给串号就由工具自己挑 —— 可能这次 read 打在 A 板、
   下次 flash 打到 B 板。串号会写进 pid 文件；若端口上跑的 server 不是本工具启动的（串号/设备名不符），
   命令会**拒绝复用**并提示先 stop。
 
@@ -376,12 +416,14 @@ make flash             # 重烧
 | 文件 | 内容 | 什么时候读 |
 |---|---|---|
 | `OBSERVE.md` | **观测手段分层**：串口探针帧 / RTT 上行 / RTT 下行 / DWT 打点 / 故障现场转储 / 黑匣子，含通用集成法 | 要接观测通道、或不确定该用哪种时 |
+| `PROBES.md` | **三种调试器**（J-Link / ST-Link / DAPLink）各自的：能力表、注意事项、能用的工具、最强用法、降级路径 | 换/买调试器、某个命令报"没探针"、想用某个高级功能时 |
+| `SETUP.md` | **工具链怎么装**：CubeCLT / STM32CubeProgrammer / OpenOCD / pyOCD / Cube 固件包 / 驱动 | 新机器、缺工具、探针认不出来时 |
 | `PITFALLS.md` | **89 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
 | `PRACTICES.md` | **工程实践手册**：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 | **新板 bring-up 前、写协议或标定模块前、收尾前**；想知道"怎么做对"（不是"怎么被坑"）时 |
 
 ### 🔟 十条最高频的坑（内联速查，全文见 PITFALLS.md）
 
-1. 不用 openocd（J-Link 驱动冲突），烧录用 `JLink.exe` 不用 CubeProgrammer
+1. 烧录/校验都走命令行，图形界面拿不到返回码：J-Link 用 `JLink.exe`、ST-Link 用 `STM32_Programmer_CLI -w -v`、DAPLink 用 `openocd ... program verify`（插哪个用哪个，`probe list` 看现状）
 2. 设备名要完整：`STM32H743VI`（不是 `STM32H743`）
 3. **板子跑旧固件**是最常见的假 bug → `verify` 命令一键比对
 4. 调试器只做两件事：断点确认执行、单次现场快照；**别用它连续读数据**（halt 后全是冻结快照）
@@ -395,11 +437,19 @@ make flash             # 重烧
 ## 环境变量
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| JLINK_GDB_SERVER | 自动 | JLinkGDBServerCL 路径 |
+| JLINK_GDB_SERVER | 自动 | JLinkGDBServerCL 路径（J-Link 专用） |
 | STM32_DEBUG_GDB | 自动 | gdb 命令 |
 | JLINK_GDB_PORT | 3333 | GDB 端口 |
 | JLINK_SN | 空 | J-Link 序列号 |
-| JLINK_RTT_LOGGER | 自动 | JLinkRTTLogger 路径(RTT 抓包) |
+| JLINK_RTT_LOGGER | 自动 | JLinkRTTLogger 路径（J-Link 专用，RTT 抓包） |
+| STM32_DEV_PROBE | 自动 | 强制用一种调试器(jlink/stlink/daplink); 优先级: --probe > 本变量 > 工程配置 > 自动探测 |
+| STM32_PROGRAMMER_CLI | 自动 | STM32_Programmer_CLI 路径(ST-Link 烧录/校验/救砖/选项字节) |
+| OPENOCD | 自动 | openocd 路径(DAPLink 烧录 + ST-Link/DAPLink 的调试服务) |
+| STLINK_GDB_SERVER | 自动 | ST-LINK_gdbserver 路径(可选: SWO/semihosting) |
+| PYOCD | 自动 | pyocd 路径(可选: 列 DAPLink 探针) |
+| STM32_CUBE_REPO | ~/STM32Cube/Repository | Cube 固件包目录(`new` 脚手架找 CMSIS 头/启动文件/链接脚本)
+
+先跑 `probe list` 和 `setup` 看哪些缺、怎么装 —— 装法见 **SETUP.md**。
 
 ---
 
@@ -409,20 +459,22 @@ make flash             # 重烧
 ```
 stm32-dev/
 ├── SKILL.md            (本文件: 流程 + 方法论 + 命令用法 + 十条速查)
+├── PROBES.md           (附录: 三种调试器 —— 能力/注意事项/可用工具/最强用法/降级路径)
+├── SETUP.md            (附录: 工具链怎么装 + 驱动 + 环境变量)
 ├── OBSERVE.md          (附录: 观测手段分层 + 通用集成法)
 ├── PITFALLS.md         (附录: 89 条实战坑 + 主题索引)
 ├── PRACTICES.md        (附录: 工程实践手册 —— 上电时序/协议从站/控制与标定/状态灯/台架/上位机/流程/硬件板级)
 ├── CHANGELOG.md        (版本演进)
 └── scripts/
-    └── stm32-dev.py    (单文件引擎, 23 个命令, 仅标准库*; --json 输出)
+    └── stm32-dev.py    (单文件引擎, 27 个命令, 仅标准库*; --json 输出)
 ```
 
-* 仅 `rtt-send` 需要可选的 `pylink-square`（`pip install pylink-square`），其余命令只用标准库。
+* 只有两处要额外库：`serial` 要 `pyserial`（`pip install pyserial`）、**J-Link** 的 `rtt-send` 要 `pylink-square`（ST-Link/DAPLink 的 `rtt-send` 走 OpenOCD，不用额外库）；其余命令只用标准库。
 
 **退出码约定（脚本化/agent 依赖它）**：命令返回 None = 成功(0)；返回整数 = 该退出码；异常 = 1。
 **失败一定非零**：verify 不一致、flash 失败或刷后校验不一致、缺 ELF/hex、doctor 缺必需工具、
 rtt 没抓到数据、--check-seq 检出丢帧、build-verify 断言未满足、cleanup --all 缺 --force、
 识别不出芯片型号。--json 里的 ok 字段与退出码一致。
 
-命令：`preflight` `doctor` `read` `write` `break` `continue` `step` `info` `attach` `start` `stop` `svd`
-`flash` `verify` `reset` `rtt` `rtt-send` `blackbox` `init-rtt` `init-fault` `cleanup` `selftest` `build-verify`
+命令：`probe` `setup` `new` `preflight` `doctor` `read` `write` `break` `continue` `step` `info` `attach` `start` `stop` `svd`
+`flash` `verify` `reset` `serial` `rtt` `rtt-send` `blackbox` `init-rtt` `init-fault` `cleanup` `selftest` `build-verify`

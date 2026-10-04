@@ -33,7 +33,7 @@
 - **Logger 独占 J-Link**：`JLinkRTTLogger` 跑着的时候**不能同时 `make flash`**（抢同一台探针，会失败）。抓日志和烧录必须串行。
 
 ### 3. RTT 下行（主机→目标，运行时改参数）
-主机侧用 RTT 客户端（telnet 到 RTT Server，`JLinkRTTClient` 默认端口 19021）发送；固件在主循环轮询：
+主机侧发送：J-Link 用 RTT 客户端（telnet 到 RTT Server，`JLinkRTTClient` 默认端口 19021），或直接用技能的 `rtt-send`；**ST-Link/DAPLink 也支持**（OpenOCD 的 `rtt server` 是双向的，往 socket 写就是写目标下行缓冲），同样一条 `rtt-send`。固件在主循环轮询：
 ```c
 if (SEGGER_RTT_HasKey()) { int c = SEGGER_RTT_GetKey(); /* 单字符命令 */ }
 /* 或批量: unsigned n = SEGGER_RTT_Read(0, buf, sizeof(buf)); */
@@ -165,7 +165,7 @@ void BlackBox_Init(void) {              /* 启动时调用, 且必须在 RTT/串
 要运行时改参数不重烧         → RTT 下行
 要查偶发死机/断言           → 故障现场转储 + 黑匣子
 ```
-**冲突提醒**：RTT 系列全都**独占同一台 J-Link**，不能同时开 RTT Logger 和 GDBServer；要并行就用 GDBServer 自带的 RTT 通道。
+**冲突提醒**：同一台探针同一时刻只能被一个程序独占。J-Link 的 RTT Logger 与 GDBServer 互斥（抓日志前先 `stop`）；ST-Link/DAPLink 走 OpenOCD 时 RTT 与 GDB 服务在同一个进程里，不必二选一。两台不同探针可以一台抓 RTT、一台烧录，互不干扰。
 
 ### 7. 交叉校验纪律（避免"自证清白"）
 

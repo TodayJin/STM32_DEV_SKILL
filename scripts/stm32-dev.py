@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""stm32-dev: 通用 STM32 J-Link + GDB 全流程调试/开发工具。
+"""stm32-dev: 探针无关的 STM32 全流程调试/开发工具(选型 + 烧录 + gdb + 观测 + 脚手架)。
+
+调试器不写死: J-Link / ST-Link(V2/V3) / DAPLink(CMSIS-DAP) 各有后端, 命令层按探针能力选路;
+选好的探针 + 序列号写进工程根的 .stm32-dev.json, 之后全自动, 不再问人。
+
+  python3 <skill>/scripts/stm32-dev.py probe list        # 支持哪些调试器、各自能力
+  python3 <skill>/scripts/stm32-dev.py probe detect      # 现在插着哪个
+  python3 <skill>/scripts/stm32-dev.py probe use stlink --serial 0025...  # 选定并写进工程配置
+  python3 <skill>/scripts/stm32-dev.py probe info jlink  # 单探针: 工具 / 最好的能力 / 注意事项 / 降级路径
+  python3 <skill>/scripts/stm32-dev.py setup             # 一键: 探针 x 工具链体检, 缺什么怎么装
+  python3 <skill>/scripts/stm32-dev.py doctor            # 环境自检
+  python3 <skill>/scripts/stm32-dev.py flash             # 按探针选路, 默认刷后逐字节校验
 
 目标: 别人下载到一个空环境也能用。自动检测环境、自动发现芯片、
 自动定位/获取 SVD, 不写死芯片和路径。
@@ -16,7 +27,7 @@
   python3 <skill>/scripts/stm32-dev.py continue | step 3 | info  # 运行控制
   python3 <skill>/scripts/stm32-dev.py attach --elf build/test.elf --device STM32H743VI
 
-=== 关键坑(踩坑记录, 详见 SKILL.md) ===
+=== J-Link 后端的关键坑(踩坑记录, 详见 SKILL.md; 其他探针见 PROBES.md) ===
 * 不用 openocd: J-Link 用 SEGGER 驱动, openocd 用 libusb, 二者冲突(LIBUSB_ERROR_NOT_FOUND)。
   本脚本绕开 openocd, 直接用 JLinkGDBServerCL + gdb。
 * 烧录别用 STM32CubeProgrammer: 它连 J-Link 不可靠(No debug probe detected)。
@@ -62,6 +73,8 @@ def jset(**kw):
 GDB_PORT = int(os.environ.get("JLINK_GDB_PORT", "3333"))
 DEFAULT_SERIAL = os.environ.get("JLINK_SN", "")
 _SERIAL = DEFAULT_SERIAL     # 运行时由 main() 用 --serial 覆盖(多探针时必须给)
+_PROBE = ""                  # 生效的探针(调试器) id; main() 用 --probe / 工程配置覆盖
+_SERVER_KIND = ""   # "jlink" / "openocd": 收尾恢复运行的命令不一样
 
 # 常见安装位置(跨平台)
 WINDOWS_JLINK_DIRS = [
@@ -145,7 +158,7 @@ def _jlink_gui_pids():
         return set()
     try:
         out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq JLinkGUIServer.exe", "/NH", "/FO", "CSV"],
-                             capture_output=True, text=True, timeout=15).stdout
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15).stdout
     except Exception:
         return set()
     pids = set()
@@ -165,7 +178,7 @@ def symbol_addr_from_elf(elf, name):
     if not readelf or not elf or not os.path.isfile(elf):
         return None
     try:
-        out = subprocess.run([readelf, "-sW", elf], capture_output=True, text=True, timeout=30).stdout or ""
+        out = subprocess.run([readelf, "-sW", elf], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30).stdout or ""
     except Exception:
         return None
     for line in out.splitlines():
@@ -242,7 +255,7 @@ def infer_device_from_elf(elf):
     if not readelf or not elf or not os.path.isfile(elf):
         return None
     try:
-        out = subprocess.run([readelf, "-s", elf], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run([readelf, "-s", elf], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30).stdout
     except Exception:
         return None
     # 从 startup_stm32h743xx.o 提取 h743 -> STM32H743
@@ -452,22 +465,195 @@ class JLinkServer:
 
 
 # ---------------------------------------------------------------------------
+# OpenOCD GDB server(ST-Link / DAPLink 走这条; J-Link 有自己的 server)
+# ---------------------------------------------------------------------------
+_OCD_IFACE = {"stlink": "interface/stlink.cfg", "daplink": "interface/cmsis-dap.cfg"}
+
+
+def _ocd_target(device):
+    """芯片型号 -> OpenOCD 目标脚本名: STM32G431CB -> stm32g4x。认不出给 None(不猜)。"""
+    m = re.match(r"STM32([A-Z])(\d)", (device or "").upper())
+    if not m:
+        return None
+    return "stm32%s%sx" % (m.group(1).lower(), m.group(2))
+
+
+class OpenOCDServer:
+    """用 OpenOCD 起 GDB server, 给 ST-Link / DAPLink 提供和 J-Link 一样的 gdb 通道。
+
+    接口与 JLinkServer 一致, 这样 with_server 能无差别复用。与 J-Link 的差别(踩坑点):
+      * 探针选号用 `adapter serial <SN>`, 不是 J-Link 的 `-select USB=<SN>`;
+      * 收尾恢复运行用 `monitor resume`, 不是 J-Link 的 `monitor go`;
+      * 探针被别的程序占着/没插时 OpenOCD 可能直接退出, 错误只在日志里, 所以失败要把日志尾巴打出来。
+    """
+
+    def __init__(self, device, port, serial, probe="stlink"):
+        self.device = device
+        self.port = port
+        self.serial = serial or ""
+        self.probe = probe if probe in _OCD_IFACE else "stlink"
+        self.proc = None
+        self.cmd = []
+
+    def is_up(self):
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=0.5):
+                return True
+        except OSError:
+            return False
+
+    def wait_up(self, seconds=6.0):
+        """等端口可用; openocd 若已经自己退出了就不再等(区别于 J-Link 的纯超时)。"""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self.is_up():
+                return True
+            if self.proc is not None and self.proc.poll() is not None:
+                return False
+            time.sleep(0.2)
+        return False
+
+    def argv(self, openocd):
+        """拼 openocd 命令行; 认不出目标脚本给 None。"""
+        tgt = _ocd_target(self.device)
+        if not tgt:
+            return None
+        args = [openocd, "-f", _OCD_IFACE[self.probe], "-c", "transport select swd"]
+        if self.serial:
+            args += ["-c", "adapter serial %s" % self.serial]
+        # 只留 gdb 端口: telnet/tcl 端口的命令名在 0.11(下划线) / 0.12(空格) 之间变过, 不写就不会踩
+        args += ["-f", "target/%s.cfg" % tgt, "-c", "gdb_port %d" % self.port]
+        return args
+
+    def start(self, detached=False):
+        openocd = find_openocd()
+        if not openocd:
+            return ("ERROR: 没找到 OpenOCD(ST-Link / DAPLink 靠它提供 GDB 通道)。"
+                    "装法: winget install xpack-dev-tools.openocd-xpack, 或设 OPENOCD 指向 openocd.exe。")
+        if self.is_up():
+            return "OpenOCD GDB server already listening on %d" % self.port
+        args = self.argv(openocd)
+        if not args:
+            return ("ERROR: 认不出芯片(%s)对应的 OpenOCD 目标脚本。用 --device STM32G431CB 这样给全型号。"
+                    % (self.device or "?"))
+        self.cmd = args
+        log = os.path.join(tempfile.gettempdir(), "openocd-server.log")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if detached and os.name == "nt":
+            flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        self.proc = subprocess.Popen(_argv_for(args[0], *args[1:]),
+                                     stdout=open(log, "w"), stderr=subprocess.STDOUT,
+                                     creationflags=flags)
+        if detached:
+            self._write_pid(self.proc.pid)
+        for _ in range(48):
+            if self.is_up() and (self.proc is None or self.proc.poll() is None):
+                return ("OpenOCD GDB server started on %d (detached)" % self.port if detached
+                        else "OpenOCD GDB server started on %d" % self.port)
+            if self.proc is not None and self.proc.poll() is not None:
+                return ("ERROR: OpenOCD 退出了(没起 GDB 端口)。常见原因: 没插探针 / 探针被别的程序占着 / "
+                        "目标脚本名不对。日志: %s" % log)
+            time.sleep(0.25)
+        return "ERROR: OpenOCD GDB server 没起来(see %s)" % log
+
+    @staticmethod
+    def _log_path():
+        return os.path.join(tempfile.gettempdir(), "openocd-server.log")
+
+    def tail_log(self, n=14):
+        """失败时把 openocd 日志尾巴打出来 —— 真正的原因(opencod 的报错)只在这里。"""
+        try:
+            with open(self._log_path()) as f:
+                return "".join(f.readlines()[-n:]).strip()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _pid_file():
+        return os.path.join(tempfile.gettempdir(), "stm32-dev-openocd-server.pid")
+
+    def _write_pid(self, pid):
+        try:
+            with open(self._pid_file(), "w") as f:
+                f.write("%d %s %s" % (pid, self.device or "", self.serial or ""))
+        except OSError:
+            pass
+
+    @classmethod
+    def _clear_pid(cls):
+        try:
+            os.remove(cls._pid_file())
+        except OSError:
+            pass
+
+    @classmethod
+    def _read_pid_meta(cls):
+        try:
+            with open(cls._pid_file()) as f:
+                parts = (f.read().split() + ["", ""])[:3]
+            if parts[0].isdigit():
+                return int(parts[0]), parts[1], parts[2]
+        except OSError:
+            pass
+        return None, "", ""
+
+    @classmethod
+    def _read_pid(cls):
+        return cls._read_pid_meta()[0]
+
+    def is_ours(self):
+        """占着端口的是不是本工具起的(多探针防串板): pid 文件 + 进程名 + 端口归属三重校验。"""
+        pid, dev, sn = self._read_pid_meta()
+        if pid and pid in _pids_of("openocd"):
+            if sn and self.serial and sn != self.serial:
+                return False
+            return True
+        owner = _port_owner_pid(self.port)
+        if owner is None:
+            return False
+        if owner in _pids_of("openocd"):
+            print("    [note] 端口 %d 上的 openocd 不是本工具记录的(可能是上次残留), 按复用处理。" % self.port)
+            return True
+        return False
+
+    def stop(self):
+        pid = self._read_pid()
+        if pid:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                else:
+                    import signal
+                    os.kill(pid, signal.SIGKILL)
+                self._clear_pid()
+                return "Stopped OpenOCD GDB server (pid %s)" % pid
+            except Exception:
+                pass
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            return "Stopped OpenOCD GDB server"
+        return "No running server"
+
+
+# ---------------------------------------------------------------------------
 # gdb
 # ---------------------------------------------------------------------------
 def run_gdb(elf, commands, interactive=False, resume=True):
     """执行 gdb 命令。
 
-    resume=True: 收尾用 `monitor go` 恢复目标运行。
+    resume=True: 收尾恢复目标运行(按后端选命令: J-Link 用 `monitor go`, OpenOCD 用 `monitor resume`)。
       * `detach` 不等于恢复运行(坑#16) —— 读完变量后 CPU 一直停着, 后续 RTT/串口看起来像"板子死了";
       * 不能用 gdb 的 `continue`: --batch 下它会阻塞到目标停下(坑#8), 而 `monitor go` 立即返回。
     """
     gdb = find_gdb()
     if not gdb:
         return "ERROR: 找不到 arm-none-eabi-gdb / gdb-multiarch。请装 STM32CubeCLT 或设置 STM32_DEBUG_GDB。"
+    go = "monitor resume" if _SERVER_KIND == "openocd" else "monitor go"
     cmds = ["target remote :%d" % GDB_PORT, "monitor halt"] + commands
     if not interactive:
         if resume:
-            cmds += ["monitor go"]
+            cmds += [go]
         cmds += ["detach", "quit"]
     fd, path = tempfile.mkstemp(suffix=".gdb")
     with os.fdopen(fd, "w") as f:
@@ -476,8 +662,8 @@ def run_gdb(elf, commands, interactive=False, resume=True):
     if elf:
         argv.append(elf)
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=90)
-        return result.stdout + result.stderr
+        result = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+        return (result.stdout or "") + (result.stderr or "")
     finally:
         os.remove(path)
 
@@ -532,7 +718,11 @@ def with_server(device, elf, gdb_commands, resume=True, serial=None):
     """
     dev = resolve_device(None, elf, explicit=device)
     sn = serial if serial is not None else _SERIAL
-    srv = JLinkServer(dev, GDB_PORT, sn)
+    global _SERVER_KIND
+    kind = probe_for_work(verbose=False) or "jlink"
+    _SERVER_KIND = "openocd" if kind in ("stlink", "daplink") else "jlink"
+    srv = (OpenOCDServer(dev, GDB_PORT, sn, kind) if _SERVER_KIND == "openocd"
+           else JLinkServer(dev, GDB_PORT, sn))
     managed = False
     if srv.is_up():
         if not srv.is_ours():
@@ -577,22 +767,52 @@ def infer_elf():
 # 命令
 # ---------------------------------------------------------------------------
 def cmd_doctor(args):
-    print("=== STM32 J-Link Debug - 环境自检 ===")
-    jlink = find_jlink_server()
+    print("=== STM32 调试环境自检 ===")
     gdb = find_gdb()
     readelf = find_readelf()
     py = find_python()
     rtt = find_rtt_logger()
-    probe = jlink   # J-Link GDB server 存在即可判定驱动就绪
-    status = {
-        "J-Link GDB server": ("OK  " + jlink) if jlink else "缺失 请装 SEGGER J-Link 驱动 (或设 JLINK_GDB_SERVER)",
-        "arm-none-eabi-gdb": ("OK  " + gdb) if gdb else "缺失 请装 STM32CubeCLT 或设 STM32_DEBUG_GDB",
-        "arm-none-eabi-readelf": ("OK  " + readelf) if readelf else "缺失(可选, 用于自动识别芯片)",
-        "python3": ("OK  " + py) if py else "缺失 请装 python3",
-        "JLinkRTTLogger(可选)": ("OK  " + rtt) if rtt else "缺失(可选, 仅 RTT 抓包用)",
-    }
+    jlink = find_jlink_server()
+    ocd = find_openocd()
+    stcli = find_stm32_cli()
+    pyocd = find_pyocd()
+    # 这次用哪个调试器: 认出来就按它的工具链检查, 认不出就三家都报一遍(不拦)
+    pid, serial, why = "", "", ""
+    try:
+        pid, serial, why = resolve_probe(args, verbose=False)
+    except SkillError as e:
+        print("  [!!] 调试器: %s" % e)
+    if pid == "jlink":
+        status = {
+            "J-Link GDB server(调试)": ("OK  " + jlink) if jlink else "缺失 请装 SEGGER J-Link 软件包 (或设 JLINK_GDB_SERVER)",
+            "JLinkRTTLogger(可选, RTT 抓包)": ("OK  " + rtt) if rtt else "缺失(可选, 只有 J-Link 抓 RTT 才用)",
+        }
+    elif pid == "stlink":
+        status = {
+            "STM32_Programmer_CLI(烧录/校验/救援)": ("OK  " + stcli) if stcli else "缺失 请装 STM32CubeCLT (或设 STM32_PROGRAMMER_CLI)",
+            "OpenOCD(调试/断点/读变量)": ("OK  " + ocd) if ocd else "缺失 请装 openocd (或设 OPENOCD)",
+        }
+    elif pid == "daplink":
+        status = {
+            "OpenOCD(烧录 + 调试)": ("OK  " + ocd) if ocd else "缺失 请装 openocd (或设 OPENOCD)",
+            "pyOCD(可选, 列探针/备用烧录)": ("OK  " + pyocd) if pyocd else "缺失(可选, pip install pyocd)",
+        }
+    else:
+        status = {
+            "J-Link 工具": ("OK  " + jlink) if jlink else "缺失(没定调试器时按它检查)",
+            "STM32_Programmer_CLI": ("OK  " + stcli) if stcli else "缺失(ST-Link 走它烧录)",
+            "OpenOCD": ("OK  " + ocd) if ocd else "缺失(ST-Link/DAPLink 的调试后端)",
+        }
+    status["arm-none-eabi-gdb"] = ("OK  " + gdb) if gdb else "缺失 请装 STM32CubeCLT 或设 STM32_DEBUG_GDB"
+    status["arm-none-eabi-readelf"] = ("OK  " + readelf) if readelf else "缺失(可选, 用于自动识别芯片)"
+    status["python3"] = ("OK  " + py) if py else "缺失 请装 python3"
     for k, v in status.items():
         print("  [%s] %s" % ("OK" if v.startswith("OK") else "!!", v))
+    if pid:
+        print("  [OK] 这次用: %s   (依据: %s%s)" % (PROBE_DEFS[pid]["name"], why,
+              (", 序列号 " + serial) if serial else ""))
+    tool_ok = {"jlink": bool(jlink), "stlink": bool(stcli), "daplink": bool(ocd)}.get(pid,
+                                                                                     bool(jlink or stcli or ocd))
 
     # ELF 符号可用性(RTT 控制块 / 黑匣子)
     elf = args.elf or infer_elf()
@@ -604,12 +824,23 @@ def cmd_doctor(args):
         print("  [%s] 黑匣子 g_bb: %s" % ("OK" if bb_sym else "--",
               ("0x%08X" % bb_sym) if bb_sym else "未找到(没接黑匣子, 可选)"))
     stale = _warn_stale_jlink()
+    if pid in ("stlink", "daplink"):
+        extra = []
+        try:
+            extra = [("openocd.exe", p) for p in _pids_of("openocd.exe")]
+        except Exception:
+            extra = []
+        if extra:
+            print("  [!!] 有残留 OpenOCD 进程(pid %s) -> 跑一次 cleanup 收场" % ", ".join(str(p) for _, p in extra))
+        stale = stale + extra
     if not stale:
-        print("  [OK] 无残留 J-Link 进程")
+        print("  [OK] 无残留调试器进程")
     # 必需工具缺失 -> 退出码非零(doctor 的意义就是"环境是否就绪")
-    missing_required = [k for k, v in (("JLinkGDBServer", jlink), ("arm-none-eabi-gdb", gdb),
-                                       ("python3", py)) if not v]
-    jset(tools={"jlink_gdb_server": jlink, "gdb": gdb, "readelf": readelf,
+    missing_required = [k for k, v in (("arm-none-eabi-gdb", gdb), ("python3", py),
+                                       ("调试器工具链", tool_ok)) if not v]
+    jset(probe=pid, probe_source=why, serial=serial,
+         tools={"jlink_gdb_server": jlink, "stm32_programmer_cli": stcli, "openocd": ocd,
+                "pyocd": pyocd, "gdb": gdb, "readelf": readelf,
                 "rtt_logger": rtt, "objcopy": find_objcopy()},
          stale_processes=[{"name": n, "pid": p} for n, p in stale])
 
@@ -625,16 +856,23 @@ def cmd_doctor(args):
             print("--- 未能从 ELF 自动识别芯片, 请用 --device 指定 ---")
 
     # 板子连接提示(探测不可靠, 直接提示)
-    print("--- J-Link / 板子 ---")
-    if probe:
-        print("  J-Link 驱动已就绪。连接板子后直接 read 调试即可。")
-        print("  若连不上: 检查 SWD(SWDIO/SWCLK/GND/VCC)接线、板子供电、--device 型号。")
+    print("--- 调试器 / 板子 ---")
+    if pid == "jlink":
+        print("  J-Link: 烧录用 JLink.exe, 调试/读变量用 JLinkGDBServerCL" + ("" if jlink else "  <- 但没找到, 先装驱动"))
+    elif pid == "stlink":
+        print("  ST-Link: 烧录/校验走 STM32_Programmer_CLI, 调试/读变量走 OpenOCD"
+              + ("" if (stcli and ocd) else "  <- 上面缺的那个要先补上"))
+    elif pid == "daplink":
+        print("  DAPLink: 烧录和调试都走 OpenOCD" + ("" if ocd else "  <- 但没找到 openocd"))
     else:
-        print("  未找到 J-Link 驱动, 请先装 SEGGER J-Link 驱动。")
+        print("  还没定调试器: 先 probe detect 认出插着的那个, 再 probe use <名字>")
+    print("  连不上先查: SWD(SWDIO/SWCLK/GND/VCC)接线、板子供电、--device 型号、探针有没有被别的程序占着。")
     print("--- 下一步 ---")
     print("  1) 编译出 ELF: make")
     print("  2) 读变量:   stm32-dev.py read g_motor --elf build/test.elf")
     print("  3) 若自动识别芯片失败: 加 --device STM32H743VI")
+    if not pid:
+        print("  0) 先定调试器: stm32-dev.py probe detect -> probe use <jlink|stlink|daplink>")
     if missing_required:
         print("!! 缺少必需工具: %s -> 退出码 1" % ", ".join(missing_required))
         return 1
@@ -899,12 +1137,46 @@ def _pf_wrap(s, width):
     return out
 
 
+def _resume_cmd():
+    """收尾恢复运行用哪条 monitor 命令: J-Link 是 `go`, OpenOCD(ST-Link/DAPLink) 是 `resume`。
+    写死 `monitor go` 会让 ST-Link/DAPLink 的 continue 直接失败(OpenOCD 没这条命令)。"""
+    kind = _PROBE or _SERVER_KIND        # _PROBE 是这条命令选定的探针, 最权威
+    if not kind:
+        try:
+            kind = probe_for_work()
+        except Exception:
+            kind = ""
+    return "monitor resume" if kind in ("stlink", "daplink") else "monitor go"
+
+
+_CAST = {1: "unsigned char", 2: "unsigned short", 4: "unsigned int", 8: "unsigned long long"}
+
+
+def _read_expr(t, size=4):
+    """裸地址 -> gdb 能读的表达式; 符号名(或任意 gdb 表达式)原样返回。
+    有了它就能读没有 SVD 的东西: DWT / ITM / SCB / TPIU, 例如 0xE0001004(DWT CYCCNT)、
+    0xE000ED00(CPUID)、0xE000ED28(CFSR)。"""
+    m = re.fullmatch(r"\s*(0[xX][0-9a-fA-F]+|\d+)\s*", t or "")
+    if not m:
+        return t
+    return "*(volatile %s *)%s" % (_CAST.get(int(size or 4), "unsigned int"), m.group(1))
+
+
+def _write_expr(var, size=4):
+    """裸地址 -> gdb 能写的左值; 符号名原样返回。例: write 0xE000EDF0=0xA05F0003"""
+    m = re.fullmatch(r"\s*(0[xX][0-9a-fA-F]+|\d+)\s*", var or "")
+    if not m:
+        return var
+    return "*(volatile %s *)%s" % (_CAST.get(int(size or 4), "unsigned int"), m.group(1))
+
+
 def cmd_read(args):
     elf = args.elf or infer_elf()
     if not elf:
         print("ERROR: 未找到 ELF。请用 --elf 指定, 或先 make。")
         return 1
-    cmds = ["print %s" % t for t in args.targets]
+    size = getattr(args, "size", 4)
+    cmds = ["print %s" % _read_expr(t, size) for t in args.targets]
     out = with_server(args.device, elf, cmds, resume=not args.keep_halted)
     print(out)
     jset(targets=list(args.targets),
@@ -921,7 +1193,8 @@ def cmd_write(args):
     for t in args.targets:
         if "=" in t:
             var, val = t.split("=", 1)
-            outs.append(with_server(args.device, elf, ["set %s = %s" % (var, val), "print %s" % var],
+            lhs = _write_expr(var, getattr(args, "size", 4))
+            outs.append(with_server(args.device, elf, ["set %s = %s" % (lhs, val), "print %s" % lhs],
                                     resume=not args.keep_halted))
         else:
             outs.append("!! 用法错误(应为 VAR=value): %s" % t)
@@ -940,9 +1213,10 @@ def cmd_break(args):
 
 
 def cmd_contr(args):
-    """恢复运行。用 `monitor go` 而不是 gdb 的 `continue`:
-    --batch 下 `continue` 会一直阻塞到目标停下(坑#8), `monitor go` 立即返回。"""
-    print(with_server(args.device, args.elf or infer_elf(), ["monitor go"], resume=False))
+    """恢复运行。用 monitor 命令而不是 gdb 的 `continue`:
+    --batch 下 `continue` 会一直阻塞到目标停下(坑#8), monitor 命令立即返回。
+    J-Link 用 `monitor go`, OpenOCD(ST-Link/DAPLink) 用 `monitor resume` —— 见 _resume_cmd()。"""
+    print(with_server(args.device, args.elf or infer_elf(), [_resume_cmd()], resume=False))
 
 
 def cmd_step(args):
@@ -958,21 +1232,29 @@ def cmd_info(args):
 
 
 def cmd_start(args):
-    """启动常驻 J-Link GDB server, 供后续 read/write 复用(延迟更低)。"""
+    """启动常驻 GDB server, 供后续 read/write 复用(延迟更低)。按探针选后端。"""
     dev = resolve_device(args)      # 不猜型号: start 也要给对设备名
-    srv = JLinkServer(dev, GDB_PORT, args.serial or _SERIAL)
+    kind = probe_for_work(verbose=False) or "jlink"
+    if kind in ("stlink", "daplink"):
+        srv = OpenOCDServer(dev, GDB_PORT, args.serial or _SERIAL, kind)
+    else:
+        srv = JLinkServer(dev, GDB_PORT, args.serial or _SERIAL)
     msg = srv.start(detached=True)
     print(msg)
     if msg.startswith("ERROR"):
+        if isinstance(srv, OpenOCDServer):
+            print(srv.tail_log())
         return 1
-    print("常驻 J-Link GDB server 已启动。后续 read/write 将复用, 延迟更低")
+    print("常驻 GDB server 已启动(%s)。后续 read/write 将复用, 延迟更低" % kind)
     print("停止: stm32-dev.py stop")
     return 0
 
 
 def cmd_attach(args):
     dev = resolve_device(args)
-    srv = JLinkServer(dev, GDB_PORT, args.serial or _SERIAL)
+    kind = probe_for_work(verbose=False) or "jlink"
+    srv = (OpenOCDServer(dev, GDB_PORT, args.serial or _SERIAL, kind) if kind in ("stlink", "daplink")
+           else JLinkServer(dev, GDB_PORT, args.serial or _SERIAL))
     msg = srv.start(detached=True)
     print(msg)
     if msg.startswith("ERROR"):
@@ -982,8 +1264,14 @@ def cmd_attach(args):
 
 
 def cmd_stop(args):
-    srv = JLinkServer(args.device or "STUB", GDB_PORT, "")
-    print(srv.stop())
+    """停掉可能存在的常驻 server(J-Link 与 OpenOCD 都试一遍, 谁在停谁)。"""
+    msgs = []
+    for srv in (JLinkServer(args.device or "STUB", GDB_PORT, ""),
+                OpenOCDServer(args.device or "STUB", GDB_PORT, "", "stlink")):
+        m = srv.stop()
+        if m and m != "No running server":
+            msgs.append(m)
+    print("\n".join(msgs) if msgs else "No running server")
 
 
 # 注: cmd_svd 只有一处定义(在文件后半, 支持定位 SVD + 读寄存器解码位域)
@@ -1022,8 +1310,238 @@ def _looks_like_segger(path):
     return False
 
 
+def _stlink_conn(serial="", freq=8000, mode=""):
+    """拼官方 CLI 的 -c 连接串(参数名/取值以 STM32_Programmer_CLI --help 为准)。"""
+    parts = ["port=SWD"]
+    if serial:
+        parts.append("sn=%s" % serial)
+    if freq:
+        parts.append("freq=%s" % freq)
+    if mode:
+        parts.append("mode=%s" % mode)
+    return " ".join(parts)
+
+
+def _stlink_serial(args=None):
+    """这次用哪个 ST-Link: --serial > 工程配置 > 环境变量; 没给就空(单探针时不用给)。"""
+    s = ((getattr(args, "serial", "") if args else "") or _SERIAL or "").strip()
+    return "" if s == DEFAULT_SERIAL else s
+
+
+def _mk_hex(elf):
+    """官方 CLI 烧 hex 最稳: 没有就现场用 objcopy 从 elf 生成一个。"""
+    hexfile = os.path.splitext(elf)[0] + ".hex"
+    if os.path.isfile(hexfile):
+        return hexfile
+    oc = find_objcopy()
+    if not oc:
+        return None
+    try:
+        p = subprocess.run([oc, "-O", "ihex", elf, hexfile],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    except Exception:
+        return None
+    return hexfile if (p.returncode == 0 and os.path.isfile(hexfile)) else None
+
+
+class _DryRun(Exception):
+    """--dry-run: 只把将要执行的命令打出来, 绝不碰板子。"""
+    pass
+
+
+_DRY_RUN = False
+
+
+def _dry_stop(argv):
+    """--dry-run 时打印命令并抛 _DryRun; 否则返回 False(照常真执行)。
+    烧录/复位是仅有的"会让板子动起来"的操作, 所以它们支持先看后跑。"""
+    if not _DRY_RUN:
+        return False
+    print("DRY-RUN: 只打印不执行 -> %s" % " ".join(str(x) for x in argv))
+    raise _DryRun()
+
+
+def _flash_stlink(args):
+    """ST-Link 后端烧录: STM32_Programmer_CLI -w(写) -v(官方逐字节校验) -rst(复位运行)。
+    比 J-Link 强的一点: 校验由官方工具做, 退出码可信, 不用再拉一次 gdb 去比对。"""
+    cli = find_stm32_cli()
+    if not cli:
+        print("ERROR: 找不到 STM32_Programmer_CLI(装 STM32CubeCLT / CubeProgrammer, 或设 STM32_PROGRAMMER_CLI)")
+        return 1
+    elf = args.elf or infer_elf()
+    target = args.hex or ((os.path.splitext(elf)[0] + ".hex") if elf else None)
+    if target and not os.path.isfile(target) and elf and os.path.isfile(elf):
+        target = _mk_hex(elf)
+    if not target or not os.path.isfile(target):
+        print("ERROR: 找不到要烧的文件(--hex 或 ELF): %s" % (target or args.hex or "(无)"))
+        return 1
+    conn = _stlink_conn(_stlink_serial(args), mode="UR" if getattr(args, "ur", False) else "")
+    cmd = [cli, "-c", conn, "-w", target]
+    if args.no_verify:
+        print("VERIFY: 已按 --no-verify 跳过(未校验板子固件)。")
+    else:
+        cmd.append("-v")
+    cmd.append("-rst")
+    print("ST-Link 烧录: %s" % " ".join(cmd))
+    _dry_stop(cmd)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    except subprocess.TimeoutExpired:
+        print("FLASH 超时(ST-Link 没响应; 先跑 cleanup 再试)。")
+        return 1
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out[-2000:])
+    low = out.lower()
+    if args.no_verify:
+        ok = (r.returncode == 0) and ("error" not in low) and (
+            ("download" in low) or ("programming" in low) or ("ok" in low))
+    else:
+        ok = (r.returncode == 0) and (("verified successfully" in low) or ("download verified" in low))
+    if ok:
+        print("FLASH OK: %s" % target)
+        print("  ST-Link 官方 -v 已逐字节校验; 已复位运行。")
+        jset(flashed=True, hex=target, probe="stlink", verified=not args.no_verify)
+        return 0
+    print("FLASH 失败(原因看上面的官方输出): 探针/接线/供电/读保护。")
+    if ("not a genuine st device" in low) or ("no st-link" in low) or ("no stlink" in low):
+        print("  没认到 ST-Link: 换 USB 口/线, 关掉占用它的程序(IDE、stlinkserver); 克隆件只能走 OpenOCD。")
+    if ("read out protection" in low) or ("rdp" in low):
+        print("  被读保护挡住: %s -c \"%s\" -rdu   (解保护会全片擦除)" % (cli, conn))
+    return 1
+
+
+def _reset_stlink(args):
+    """ST-Link 后端复位: 官方 CLI -rst(复位完自动运行)。"""
+    cli = find_stm32_cli()
+    if not cli:
+        print("ERROR: 找不到 STM32_Programmer_CLI")
+        return 1
+    conn = _stlink_conn(_stlink_serial(args))
+    cmd = [cli, "-c", conn, "-rst"]
+    print("ST-Link 复位: %s" % " ".join(cmd))
+    _dry_stop(cmd)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    except subprocess.TimeoutExpired:
+        print("RESET 超时。")
+        return 1
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out[-800:])
+    ok = (r.returncode == 0) and ("error" not in out.lower())
+    print("RESET %s (ST-Link)" % ("OK" if ok else "失败"))
+    return 0 if ok else 1
+
+
+def _ocd_prog_argv(probe, serial, device):
+    """拼一条 OpenOCD 命令行(烧录/复位用), 不依赖 gdb。"""
+    ocd = find_openocd()
+    if not ocd:
+        print("ERROR: 没找到 openocd(DAPLink 烧录、OpenOCD 调试后端都要它)。")
+        print("  装法: winget install xpack-dev-tools.openocd-xpack   或设环境变量 OPENOCD 指向 openocd.exe")
+        return None
+    tgt = _ocd_target(device)
+    if not tgt:
+        print("ERROR: 认不出 %s 属于哪个系列, 拼不出 openocd 的目标脚本名。" % device)
+        print("  -> 用 --device 给准确型号(例 STM32G431CB)")
+        return None
+    argv = _argv_for(ocd, "-f", _OCD_IFACE.get(probe, "interface/cmsis-dap.cfg"),
+                     "-c", "transport select swd")
+    if serial:
+        argv += ["-c", "adapter serial %s" % serial]
+    argv += ["-f", "target/%s.cfg" % tgt]
+    return argv
+
+
+def _run_openocd(argv, timeout=300):
+    _dry_stop(argv)
+    print("  %s" % " ".join(argv))
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except Exception as e:
+        print("ERROR: 跑 openocd 失败: %s" % e)
+        return None
+
+
+def _ocd_fail_hint(out):
+    low = (out or "").lower()
+    if "open failed" in low or "unable to find a matching" in low:
+        print("  -> 探针没插好, 或正被别的程序占着(GDB server / 另一个 openocd)。")
+    elif "init mode failed" in low or "dp initialisation failed" in low:
+        print("  -> 连不上目标芯片: 查供电, 或 SWD 引脚被固件关了(STM32 可以拿 ST-Link 用 mode=UR 救)。")
+    elif "no device found" in low:
+        print("  -> 芯片没响应: 查上电顺序 / 复位线 / SWDIO 接触。")
+    elif not low.strip():
+        print("  -> openocd 一句话都没输出, 通常是探针驱动没装好。")
+    else:
+        print("  -> 上面 Error 那行就是原因; 拿不准就把输出发我。")
+
+
+def _flash_openocd(args, probe):
+    """DAPLink 等探针的烧录路径: 走 OpenOCD 的 program 命令(自带逐字节校验)。"""
+    elf = args.elf or infer_elf()
+    dev = resolve_device(args, elf)
+    serial = args.serial if args.serial and args.serial != DEFAULT_SERIAL else ""
+    img = elf if (elf and os.path.isfile(elf)) else (_mk_hex(elf) or "")
+    if not img:
+        print("ERROR: 要烧的文件找不到(既没 ELF 也没 HEX)。")
+        print("  -> 加 --elf 指定, 或先 make 一下")
+        return 1
+    argv = _ocd_prog_argv(probe, serial, dev)
+    if not argv:
+        return 1
+    cmd = 'program "%s"' % img.replace("\\", "/")
+    if not args.no_verify:
+        cmd += " verify"
+    cmd += " reset exit"
+    argv += ["-c", cmd]
+    print("=== 烧录(%s / OpenOCD): %s ===" % (probe, os.path.basename(img)))
+    r = _run_openocd(argv)
+    if r is None:
+        return 1
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out[-1800:])
+    ok = (r.returncode == 0 and "error" not in out.lower()
+          and (args.no_verify or "verified ok" in out.lower()))
+    if not ok:
+        print("!! 烧录失败(退出码 %s)。" % r.returncode)
+        _ocd_fail_hint(out)
+        return 1
+    print("OK: 已烧录%s, 并复位运行。" % ("" if args.no_verify else " + 逐字节校验"))
+    jset(flashed=True, file=img, probe=probe, verified=not args.no_verify)
+    return 0
+
+
+def _reset_openocd(args, probe):
+    """DAPLink 等探针的复位路径: OpenOCD 的 reset run。"""
+    elf = args.elf or infer_elf()
+    dev = resolve_device(args, elf)
+    serial = args.serial if args.serial and args.serial != DEFAULT_SERIAL else ""
+    argv = _ocd_prog_argv(probe, serial, dev)
+    if not argv:
+        return 1
+    argv += ["-c", "init", "-c", "reset run", "-c", "shutdown"]
+    print("=== 复位运行(%s / OpenOCD) ===" % probe)
+    r = _run_openocd(argv, timeout=90)
+    if r is None:
+        return 1
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "error" in out.lower():
+        print(out[-1200:])
+        print("!! 复位失败(退出码 %s)。" % r.returncode)
+        _ocd_fail_hint(out)
+        return 1
+    print("OK: 已复位并恢复运行。")
+    jset(reset=True, probe=probe)
+    return 0
+
+
 def cmd_flash(args):
-    """用 JLink.exe 烧录 hex 到板子。"""
+    """烧录 hex/elf 到板子。按探针选路: J-Link 走 JLink.exe, ST-Link 走官方 CLI。"""
+    kind = probe_for_work()
+    if kind == "stlink":
+        return _flash_stlink(args)
+    if kind == "daplink":
+        return _flash_openocd(args, "daplink")
     elf = args.elf or infer_elf()
     dev = resolve_device(args, elf)
     jlink = find_jlink_cmd()
@@ -1041,6 +1559,8 @@ def cmd_flash(args):
     #   —— 程序不跑, 串口/485 一个字都不回, 现象像是"烧完板子就死了"。
     #   实测: `r g exit` = 0/24 应答; `r Sleep 1200 g Sleep 1200 exit` = 24/24。
     #   四种写法 JLink 都不报错, 只能靠"烧完能不能通信"分辨。
+    _dry_stop([jlink, "-device", dev, "-if", "SWD", "-speed", "4000", "-autoconnect", "1",
+               "-CommanderScript", "<临时脚本: loadfile %s; r; Sleep 1200; g; Sleep 1200; exit>" % hexfile.replace("\\", "/")])
     fd, script = tempfile.mkstemp(suffix=".jlink")
     with os.fdopen(fd, "w") as f:
         f.write("loadfile %s\nr\nSleep 1200\ng\nSleep 1200\nexit\n" % hexfile.replace("\\", "/"))
@@ -1050,9 +1570,9 @@ def cmd_flash(args):
         r = subprocess.run(
             [jlink, "-device", dev, "-if", "SWD", "-speed", "4000",
              "-autoconnect", "1", "-CommanderScript", script],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
-        out = r.stdout + r.stderr
+        out = (r.stdout or "") + (r.stderr or "")
         print(out[-1500:])
         if "O.K." in out or "Downloading file" in out:
             print("FLASH OK: %s -> %s" % (hexfile, dev))
@@ -1115,7 +1635,7 @@ def cmd_build_verify(args):
         for cmd in (build_cmd, flash_cmd):
             print(">> " + cmd)
             try:
-                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
             except subprocess.TimeoutExpired:
                 print("超时(180s): %s" % cmd)
                 return 1
@@ -1146,75 +1666,194 @@ def cmd_build_verify(args):
     return 0
 
 
-def cmd_rtt(args):
-    """抓取 RTT 上行通道(只读)。通用: 只要目标固件已集成 SEGGER RTT 即可。
+# ===== OpenOCD RTT 抓包: ST-Link / DAPLink 走这条 =====
+# 实测(xPack OpenOCD 0.12, 先 -f target/xxx.cfg 再 help rtt):
+#   rtt setup <address> <size> [ID] / rtt start / rtt stop
+#   rtt server start <port> <channel> [message] / rtt server stop <port>
+#   rtt channels / rtt channellist / rtt polling_interval
+# 注意: rtt setup / rtt start 挂在 target 上, 必须 -f target/xxx.cfg 之后才存在
+# (裸跑 openocd -c "help rtt" 只有 rtt server start/stop, 别据此以为没有这功能)。
+# init 语义(读 openocd 源码 src/openocd.c 确认): handle_init_command 里有 static initialized
+# 守卫 -> 显式 -c "init" 之后, 开机那次自动 init 是空操作, 不会初始化两遍。
+_RTT_TCP_PORT = 9090
 
-    注意: RTT 与 JLinkGDBServerCL 独占同一台 J-Link, 抓包前先 stop。
+
+def _rtt_tcp_port(args):
+    """OpenOCD RTT server 监听的本地 TCP 端口。"""
+    return int(getattr(args, "rtt_port", 0) or _RTT_TCP_PORT)
+
+
+def _rtt_addr_span(args, elf):
+    """给 OpenOCD 的 rtt setup 定搜索窗口: 返回 (addr, size); 地址解析失败返回 None。
+
+    手册原文: "OpenOCD searches for a control block with the identifier ID starting at
+    the memory address address within the next size bytes" —— 所以给的是**搜索窗口**。
+    有 ELF 符号 _SEGGER_RTT 就开小窗口(控制块就在那儿); 没有就按 --search 或全 RAM 搜。
+    """
+    if args.address:
+        try:
+            return int(str(args.address), 0), 0x400
+        except ValueError:
+            return None
+    sym = symbol_addr_from_elf(elf, "_SEGGER_RTT")
+    if sym:
+        print("RTT 控制块地址: 0x%08X (ELF 符号 _SEGGER_RTT)" % sym)
+        return sym, 0x400
+    if getattr(args, "search", None):
+        try:
+            return int(str(args.search[0]), 0), int(str(args.search[1]), 0)
+        except ValueError:
+            return None
+    print("提示: 未从 ELF 解析到 _SEGGER_RTT -> 在 0x20000000 起 128KB 内搜控制块(慢一些)")
+    return 0x20000000, 0x20000
+
+
+def _ocd_rtt_argv(ocd, probe, serial, device, addr, size, tcpport, channel):
+    """OpenOCD RTT 抓包命令行: setup(搜控制块) -> start(开始轮询) -> server(转成 TCP 流)。
+
+    末尾 catch {resume} 是必需的: init 之后核通常停在 halt(和 J-Link 的坑#16 同源),
+    不 resume 就只能读到缓冲区里的旧快照; 而核本来就在跑时 resume 会报错,
+    所以要用 Jim Tcl 的 catch 兜住(实测: 核不在跑时 catch {resume} 返回 1 且不中断命令行)。
+    """
+    tgt = _ocd_target(device)
+    iface = _OCD_IFACE.get(probe)
+    if not tgt or not iface:
+        return None
+    argv = _argv_for(ocd, "-f", iface, "-c", "transport select swd")
+    if serial:
+        argv += ["-c", "adapter serial %s" % serial]
+    argv += ["-f", "target/%s.cfg" % tgt,
+             "-c", "init",
+             "-c", 'rtt setup 0x%08X 0x%X "SEGGER RTT"' % (addr, size),
+             "-c", "rtt start",
+             "-c", "rtt server start %d %d" % (tcpport, channel),
+             "-c", "catch {resume}"]
+    return argv
+
+
+def _kill_pid(pid):
+    """强杀一个 pid(Windows 用 taskkill; 失败静默)。"""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=15)
+        else:
+            os.kill(pid, 9)
+    except Exception:
+        pass
+
+
+def _rtt_capture_ocd(args, probe):
+    """ST-Link / DAPLink 抓 RTT: 起一个 openocd, 用它的 RTT server 把上行通道转成本地 TCP 流。
+
+    与 J-Link 的差别: openocd 的 RTT server 和 gdb server 是同一个进程(不用像 J-Link 那样
+    在 logger 与 GDBServer 之间二选一), 但同一台探针同一时刻只能被一个进程用 ->
+    起之前先把常驻 server 停掉。抓完把 openocd 连同 cmd 包装一起杀干净, 否则探针一直被占。
+    返回 (outfile, logfile) 或 None(失败原因已打印)。
     """
     elf = args.elf or infer_elf()
     dev = resolve_device(args, elf)
-    # 地址优先: --address > ELF 符号 _SEGGER_RTT > 自动搜索(慢, 实测 10s+)
-    if not args.address and not args.search:
-        sym = symbol_addr_from_elf(elf, "_SEGGER_RTT")
-        if sym:
-            args.address = "0x%08X" % sym
-            print("RTT 控制块地址: %s (ELF 符号 _SEGGER_RTT)" % args.address)
-        else:
-            print("提示: 未从 ELF 解析到 _SEGGER_RTT, 退回自动搜索(可能 10s+); 建议 --elf 或 --address")
-    # 抓包前确保 CPU 在跑: gdb 读变量后 detach 不会恢复运行(坑#16), 此时 RTT 只有缓冲区快照。
-    if not args.no_resume:
-        with_server(dev, elf, ["monitor go"])
-    # RTT 客户端与 GDB server 独占同一台 J-Link: 有常驻 server 就先停掉, 否则 logger 打不开设备。
-    srv = JLinkServer(dev, GDB_PORT, getattr(args, "serial", None) or _SERIAL)
-    if srv.is_up():
-        print("检测到常驻 GDB server 占用 J-Link -> 先 stop(它与 RTT 客户端互斥)")
-        srv.stop()
-        time.sleep(0.5)
-    logger = find_rtt_logger()
-    if not logger:
-        print("ERROR: 找不到 JLinkRTTLogger。请装 SEGGER J-Link 驱动, 或设 JLINK_RTT_LOGGER 环境变量。")
-        return 1
-    # 每次用唯一文件名: JLinkRTTLogger 对已存在的文件是"追加"行为,
-    # 复用固定路径会把上次的数据混进来, 造成"数据跨了几百秒"的假象。
+    span = _rtt_addr_span(args, elf)
+    if span is None:
+        print("ERROR: 地址解析失败(要 0x 开头的十六进制): %s" % (args.address or args.search))
+        return None
+    addr, size = span
+    ocd = find_openocd()
+    if not ocd:
+        print("ERROR: 找不到 OpenOCD —— ST-Link/DAPLink 抓 RTT 靠它。装法见 SETUP.md, 或设 OPENOCD 环境变量。")
+        return None
+    sn = args.serial or _SERIAL or ""
+    port = _rtt_tcp_port(args)
+    argv = _ocd_rtt_argv(ocd, probe, sn, dev, addr, size, port, args.channel)
+    if not argv:
+        print("ERROR: 认不出 %s 属于哪个 STM32 系列, OpenOCD 需要 -f target/<系列>x.cfg。" % dev)
+        print("       -> 用 --device STM32G431CBT6 这样的完整订货号, 或给 --elf。")
+        return None
+    for srv in (JLinkServer(dev, GDB_PORT, sn), OpenOCDServer(dev, GDB_PORT, sn, probe)):
+        try:
+            if srv.is_up():
+                print("检测到常驻 GDB server -> 先 stop(它和 RTT 抓包抢同一台探针)")
+                srv.stop()
+                time.sleep(0.5)
+        except Exception:
+            pass
     outfile = args.out or os.path.join(
         tempfile.gettempdir(), "stm32-dev-rtt-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
-    logfile = os.path.join(tempfile.gettempdir(), "stm32-dev-rtt-logger.log")
-    for f in (outfile, logfile):
+    logfile = os.path.join(tempfile.gettempdir(), "stm32-dev-openocd-rtt.log")
+    for p in (outfile, logfile):
         try:
-            os.remove(f)
+            os.remove(p)
         except OSError:
             pass
-    argv = [logger, "-Device", dev, "-If", "SWD", "-Speed", "4000",
-            "-RTTChannel", str(args.channel)]
-    if args.address:
-        argv += ["-RTTAddress", args.address]
-    elif args.search:
-        argv += ["-RTTSearchRanges", "%s %s" % (args.search[0], args.search[1])]
-    argv.append(outfile)
-    print("== RTT 抓包: device=%s channel=%d %.1fs -> %s ==" % (dev, args.channel, args.seconds, outfile))
-    _warn_stale_jlink()              # 起客户端前先看有没有别的进程占着设备
-    gui_before = _jlink_gui_pids()   # JLinkRTTLogger 会连带拉起 JLinkGUIServer, 收尾要一起清
-    proc = subprocess.Popen(argv, stdout=open(logfile, "w"), stderr=subprocess.STDOUT)
-    deadline = time.time() + max(1.0, args.seconds)
-    while time.time() < deadline and proc.poll() is None:
-        time.sleep(0.2)
+    print("== RTT 抓包(OpenOCD + %s): device=%s channel=%d %.1fs -> %s =="
+          % (PROBE_DEFS.get(probe, {}).get("name", probe), dev, args.channel, args.seconds, outfile))
+    print("   " + " ".join(argv))
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name == "nt":
+        flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    before = set(_pids_of("openocd"))
+    lf = open(logfile, "wb")
+    proc = subprocess.Popen(argv, stdout=lf, stderr=subprocess.STDOUT, creationflags=flags)
+    sk = None
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            sk = socket.create_connection(("127.0.0.1", port), 0.5)
+            break
+        except OSError:
+            time.sleep(0.3)
+    if sk is None:
+        print("!! OpenOCD 没能把 RTT 服务挂到 127.0.0.1:%d(进程%s)。"
+              % (port, "已退出" if proc.poll() is not None else "还在跑"))
+        tail = _tail_text(logfile)
+        if tail:
+            print("   后台日志: %s" % tail)
+        else:
+            print("   后台日志是空的(openocd 被强杀时缓冲没落盘)。手动跑一遍看现场:")
+            print("     " + " ".join(argv))
+        _kill_pid(proc.pid)
+        for pid in (set(_pids_of("openocd")) - before):
+            _kill_pid(pid)
+        lf.close()
+        return None
+    print("已连上 RTT 通道 %d, 开始接收 %.1fs ..." % (args.channel, args.seconds))
+    buf = bytearray()
+    sk.settimeout(0.3)
+    t_end = time.time() + max(1.0, args.seconds)
+    while time.time() < t_end:
+        try:
+            chunk = sk.recv(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
     try:
-        proc.terminate()
-        proc.wait(timeout=2)     # 客户端收到终止后可能还写几秒文件, 不宜久等
+        sk.close()
+    except OSError:
+        pass
+    # 收场: cmd /c 包了一层(openocd.CMD), 只杀 cmd 会留下 openocd.exe 占着探针。
+    _kill_pid(proc.pid)
+    for pid in (set(_pids_of("openocd")) - before):
+        _kill_pid(pid)
+    try:
+        lf.close()
     except Exception:
         pass
-    if proc.poll() is None:      # 没死透就强杀, 否则它会继续占着 J-Link/继续写文件
-        try:
-            proc.kill()
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-    # 清理本次新拉起的 JLinkGUIServer: 否则它会一直占着 J-Link, 后续 gdb/抓包全部卡死。
-    for pid in (_jlink_gui_pids() - gui_before):
-        try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=15)
-        except Exception:
-            pass
+    with open(outfile, "wb") as fh:
+        fh.write(bytes(buf))
+    return (outfile, logfile)
+
+
+def _rtt_report(args, outfile, logfile=None, hints=None):
+    """RTT 抓包结果的统一判读(J-Link 与 OpenOCD 两条路共用)。
+
+    退出码: 没抓到任何数据 = 1; --check-seq 判定丢帧 = 1; 正常 = 0。
+    """
     data = ""
     if os.path.isfile(outfile):
         try:
@@ -1225,19 +1864,21 @@ def cmd_rtt(args):
     lines = [l for l in data.splitlines() if l.strip()]
     if not lines:
         print("!! 没抓到任何 RTT 数据。排查顺序(坑#27/#29/#30):")
-        print("   1) 固件里是否真的集成了 SEGGER RTT 并调用了写接口(仅 J-Link 支持 RTT 不够);")
-        print("   2) 控制块自动搜索失败 -> 加 --search <起始地址> <长度>(如 --search 0x20000000 0x20000);")
-        print("   3) J-Link 是否被其它进程占用(先 stop, 关掉 RTT Viewer/IDE);")
+        print("   1) 固件里是否真的集成了 SEGGER RTT 并调用了写接口(探针支持 RTT 不等于固件有);")
+        print("   2) 控制块搜索失败 -> 加 --search <起始地址> <长度>(如 --search 0x20000000 0x20000);")
+        print("   3) 调试器是否被其它进程占用(先 stop, 关掉 RTT Viewer/IDE/另一个 gdb server);")
         print("   4) M7/M55 开 D-Cache 时缓冲区需在非缓存区;")
-        print("   5) 自动搜索命中了 RAM 里残留的旧控制块(换过固件/改过缓冲区位置) -> 用 --address 显式指定。")
-        if os.path.isfile(logfile):
+        print("   5) 搜索命中了 RAM 里残留的旧控制块(换过固件/改过缓冲区位置) -> 用 --address 显式指定。")
+        for h in (hints or []):
+            print("   " + h)
+        if logfile and os.path.isfile(logfile):
             try:
                 with open(logfile, "r", errors="replace") as f:
-                    print("   --- logger log ---")
+                    print("   --- 后台日志尾部 ---")
                     print("\n".join(f.read().splitlines()[-15:]))
             except OSError:
                 pass
-        return 1        # 没抓到任何数据 = 失败
+        return 1
     print("抓取到 %d 行 / %.1f 秒" % (len(lines), args.seconds))
     jset(outfile=outfile, lines=len(lines), seconds=args.seconds, address=args.address)
     if len(lines) <= 2:
@@ -1270,6 +1911,128 @@ def cmd_rtt(args):
     return 0
 
 
+# RTT 地址自愈用的默认 RAM 搜索范围(控制块一定在 RAM 里)。
+_RTT_SEARCH_DEFAULT = "0x20000000 0x20000"
+
+
+def _rtt_empty(path):
+    """抓包文件里有没有真实数据(不存在 / 只有 BOM 与空白 都算空)。"""
+    try:
+        with io.open(path, "rb") as fh:
+            return len(fh.read().strip(b"\xef\xbb\xbf \r\n\t")) == 0
+    except OSError:
+        return True
+
+
+def _rtt_capture_jlink(args, dev, logger, addr_args, tag=""):
+    """跑一次 JLinkRTTLogger, 并把收尾清理做干净; 返回 (outfile, logfile)。
+
+    每次抓包前先停掉常驻 GDB server: RTT 客户端与 GDB server 独占同一台 J-Link。
+    每次用唯一文件名: JLinkRTTLogger 对已存在的文件是"追加"行为,
+    复用固定路径会把上次的数据混进来, 造成"数据跨了几百秒"的假象。
+    """
+    srv = JLinkServer(dev, GDB_PORT, getattr(args, "serial", None) or _SERIAL)
+    if srv.is_up():
+        print("检测到常驻 GDB server 占用 J-Link -> 先 stop(它与 RTT 客户端互斥)")
+        srv.stop()
+        time.sleep(0.5)
+    outfile = args.out or os.path.join(
+        tempfile.gettempdir(), "stm32-dev-rtt-%s%s.log" % (time.strftime("%Y%m%d-%H%M%S"), tag))
+    logfile = os.path.join(tempfile.gettempdir(), "stm32-dev-rtt-logger.log")
+    for f in (outfile, logfile):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    argv = [logger, "-Device", dev, "-If", "SWD", "-Speed", "4000",
+            "-RTTChannel", str(args.channel)] + list(addr_args)
+    argv.append(outfile)
+    print("== RTT 抓包: device=%s channel=%d %.1fs -> %s ==" % (dev, args.channel, args.seconds, outfile))
+    _warn_stale_jlink()              # 起客户端前先看有没有别的进程占着设备
+    gui_before = _jlink_gui_pids()   # JLinkRTTLogger 会连带拉起 JLinkGUIServer, 收尾要一起清
+    proc = subprocess.Popen(argv, stdout=open(logfile, "w"), stderr=subprocess.STDOUT)
+    deadline = time.time() + max(1.0, args.seconds)
+    while time.time() < deadline and proc.poll() is None:
+        time.sleep(0.2)
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)     # 客户端收到终止后可能还写几秒文件, 不宜久等
+    except Exception:
+        pass
+    if proc.poll() is None:      # 没死透就强杀, 否则它会继续占着 J-Link/继续写文件
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    # 清理本次新拉起的 JLinkGUIServer: 否则它会一直占着 J-Link, 后续 gdb/抓包全部卡死。
+    for pid in (_jlink_gui_pids() - gui_before):
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=15)
+        except Exception:
+            pass
+    return outfile, logfile
+
+
+def cmd_rtt(args):
+    """抓取 RTT 上行通道(只读)。通用: 只要目标固件已集成 SEGGER RTT 即可。
+
+    走哪条路由探针决定: J-Link 用 JLinkRTTLogger(要独占探针, 抓包前先 stop),
+    ST-Link/DAPLink 用 OpenOCD 的 rtt server(见 PROBES.md)。
+    """
+    probe = probe_for_work()
+    if probe in ("stlink", "daplink"):
+        got = _rtt_capture_ocd(args, probe)
+        if not got:
+            print("提示: 也可以先用别的通道观测(serial 串口探针帧 / .noinit 黑匣子), 它们和探针无关。")
+            return 1
+        return _rtt_report(args, got[0], got[1],
+                           hints=["OpenOCD 侧常见原因: 日志里出现 rtt: control block not found(固件没集成 RTT 或记错地址);",
+                                  "                        核一直停在 halt(没 resume 成功);",
+                                  "                        探针被别的进程占着(两个 stlinkserver / CubeProgrammer GUI)。"])
+    elf = args.elf or infer_elf()
+    dev = resolve_device(args, elf)
+    # 地址优先: --address > ELF 符号 _SEGGER_RTT > 自动搜索(慢, 实测 10s+)
+    if not args.address and not args.search:
+        sym = symbol_addr_from_elf(elf, "_SEGGER_RTT")
+        if sym:
+            args.address = "0x%08X" % sym
+            print("RTT 控制块地址: %s (ELF 符号 _SEGGER_RTT)" % args.address)
+        else:
+            print("提示: 未从 ELF 解析到 _SEGGER_RTT, 退回自动搜索(可能 10s+); 建议 --elf 或 --address")
+    # 抓包前确保 CPU 在跑: gdb 读变量后 detach 不会恢复运行(坑#16), 此时 RTT 只有缓冲区快照。
+    if not args.no_resume:
+        with_server(dev, elf, ["monitor go"])
+    # RTT 客户端与 GDB server 独占同一台 J-Link: 有常驻 server 就先停掉, 否则 logger 打不开设备。
+    srv = JLinkServer(dev, GDB_PORT, getattr(args, "serial", None) or _SERIAL)
+    if srv.is_up():
+        print("检测到常驻 GDB server 占用 J-Link -> 先 stop(它与 RTT 客户端互斥)")
+        srv.stop()
+        time.sleep(0.5)
+    logger = find_rtt_logger()
+    if not logger:
+        print("ERROR: 找不到 JLinkRTTLogger。请装 SEGGER J-Link 驱动, 或设 JLINK_RTT_LOGGER 环境变量。")
+        return 1
+    addr_args = ()
+    if args.address:
+        addr_args = ("-RTTAddress", str(args.address))
+    elif args.search:
+        addr_args = ("-RTTSearchRanges", "%s %s" % (args.search[0], args.search[1]))
+    outfile, logfile = _rtt_capture_jlink(args, dev, logger, addr_args)
+    # 地址自愈: 用 ELF 符号地址一条数据都没抓到 -> 板子跑的多半不是这份 ELF(坑#9),
+    # 符号地址属于别的构建; 这时改用 RAM 搜索再抓一次, 而不是直接报"没抓到数据"。
+    if not (addr_args[:1] == ("-RTTSearchRanges",)) and _rtt_empty(outfile):
+        why = ("地址 %s(来自 ELF 符号 _SEGGER_RTT)" % args.address) if args.address else "自动搜索"
+        print("!! %s 没抓到任何数据:" % why)
+        print("   最常见原因: 板子跑的不是这份 ELF(坑#9, 符号地址是旧构建的布局); 或固件没写 RTT。")
+        print("   自动改用 RAM 搜索再抓一次(%s)..." % _RTT_SEARCH_DEFAULT)
+        if not args.no_resume:
+            with_server(dev, elf, ["monitor go"])
+        outfile, logfile = _rtt_capture_jlink(
+            args, dev, logger, ("-RTTSearchRanges", _RTT_SEARCH_DEFAULT), tag="-rescan")
+    return _rtt_report(args, outfile, logfile)
+
+
 def _warn_stale_jlink():
     """开设备前检查会**独占** J-Link 的残留进程并告警。
 
@@ -1277,10 +2040,10 @@ def _warn_stale_jlink():
     真正独占的是 JLinkRTTLogger / JLinkGDBServer 这类正在用设备的进程。
     """
     stale = []
-    for n in ("JLinkRTTLogger", "JLinkGDBServerCL", "JLinkGDBServer", "JLinkRemoteServer"):
+    for n in ("JLinkRTTLogger", "JLinkGDBServerCL", "JLinkGDBServer", "JLinkRemoteServer", "openocd"):
         stale += [(n, p) for p in _pids_of(n)]
     if stale:
-        print("!! 检测到残留 J-Link 进程(会独占设备, 后续命令会卡死):")
+        print("!! 检测到残留调试进程(J-Link / OpenOCD, 会独占探针, 后续命令会卡死):")
         for n, pid in stale:
             print("     %-22s pid=%d" % (n, pid))
         print("   -> 先执行: python stm32-dev.py cleanup")
@@ -1298,8 +2061,8 @@ def cmd_cleanup(args):
     要全局清场必须显式加 --all --force。
     """
     names = ("JLinkRTTLogger", "JLinkGUIServer", "JLinkGDBServerCL", "JLinkGDBServer",
-             "JLinkRemoteServer", "JLinkRemoteServerCL")
-    own_pid = JLinkServer._read_pid()
+             "JLinkRemoteServer", "JLinkRemoteServerCL", "openocd")
+    own_pid = JLinkServer._read_pid() or OpenOCDServer._read_pid()
     own = None
     if own_pid:
         for n in names:
@@ -1354,7 +2117,7 @@ def _port_owner_pid(port):
         return None
     try:
         out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
-                             text=True, timeout=15).stdout or ""
+                             text=True, encoding="utf-8", errors="replace", timeout=15).stdout or ""
     except Exception:
         return None
     for line in out.splitlines():
@@ -1374,7 +2137,7 @@ def _pids_of(imagename):
     try:
         if os.name == "nt":
             out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq %s.exe" % imagename,
-                                  "/NH", "/FO", "CSV"], capture_output=True, text=True, timeout=15).stdout or ""
+                                  "/NH", "/FO", "CSV"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15).stdout or ""
             for line in out.splitlines():
                 parts = [p.strip('"') for p in line.split('","')]
                 if len(parts) >= 2 and parts[0].lower().startswith(imagename.lower()):
@@ -1383,7 +2146,7 @@ def _pids_of(imagename):
                     except ValueError:
                         pass
         else:
-            out = subprocess.run(["pgrep", "-f", imagename], capture_output=True, text=True, timeout=15).stdout or ""
+            out = subprocess.run(["pgrep", "-f", imagename], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15).stdout or ""
             pids = [int(x) for x in out.split() if x.isdigit()]
     except Exception:
         pass
@@ -1673,6 +2436,8 @@ def run_jlink_script(dev, lines, timeout=120):
     jlink = find_jlink_cmd()
     if not jlink:
         return "ERROR: 找不到 JLink.exe。"
+    _dry_stop([jlink, "-device", dev, "-if", "SWD", "-speed", "4000", "-autoconnect", "1",
+               "-CommanderScript", "<临时脚本: %s>" % "; ".join(lines)])
     fd, path = tempfile.mkstemp(suffix=".jlink")
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -1680,7 +2445,7 @@ def run_jlink_script(dev, lines, timeout=120):
     try:
         r = subprocess.run([jlink, "-device", dev, "-if", "SWD", "-speed", "4000",
                             "-autoconnect", "1", "-CommanderScript", path],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         return (r.stdout or "") + (r.stderr or "")
     except Exception as e:
         return "ERROR: %s" % e
@@ -1702,7 +2467,7 @@ def _elf_load_info(elf):
     if not readelf:
         return None
     try:
-        out = subprocess.run([readelf, "-lW", elf], capture_output=True, text=True, timeout=30).stdout or ""
+        out = subprocess.run([readelf, "-lW", elf], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30).stdout or ""
     except Exception:
         return None
     segs = []
@@ -1721,8 +2486,83 @@ def _elf_load_info(elf):
     return base, end - base
 
 
+def _verify_stlink(args):
+    """ST-Link 的刷后校验: 从板子读回 Flash, 与本地镜像逐字节比(J-Link 路径同一条铁律)。"""
+    elf = args.elf or infer_elf()
+    if not elf or not os.path.isfile(elf):
+        print("ERROR: 未找到 ELF。请 --elf 指定。")
+        return 1
+    cli = find_stm32_cli()
+    if not cli:
+        print("ERROR: 没找到 STM32_Programmer_CLI(ST-Link 的官方命令行)。")
+        return 1
+    objcopy = find_objcopy()
+    if not objcopy:
+        print("ERROR: 找不到 arm-none-eabi-objcopy。")
+        return 1
+    info = _elf_load_info(elf)
+    if not info:
+        print("ERROR: 解析 ELF LOAD 段失败(需要 arm-none-eabi-readelf)。")
+        return 1
+    base, size = info
+    tmp_bin = os.path.join(tempfile.gettempdir(), "stm32-dev-verify.bin")
+    tmp_read = os.path.join(tempfile.gettempdir(), "stm32-dev-verify-read.bin")
+    try:
+        os.remove(tmp_read)      # 旧文件必须删: CLI 不改写已存在的读回文件时会被当成新结果
+    except OSError:
+        pass
+    try:
+        subprocess.run([objcopy, "-O", "binary", elf, tmp_bin], capture_output=True, timeout=60, check=True)
+    except Exception as e:
+        print("ERROR: objcopy 失败: %s" % e)
+        return 1
+    data = open(tmp_bin, "rb").read()[:size]
+    size = len(data)
+    print("ELF 镜像: base=0x%08X size=%d -> 用 ST-Link 从板子读回 Flash 比对..." % (base, size))
+    conn = _stlink_conn(_stlink_serial(args))
+    argv = [cli, "-c", conn, "-u", "0x%08X" % base, "0x%X" % size, tmp_read]
+    print("  %s" % " ".join(argv))
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(120, size // 512))
+    except Exception as e:
+        print("ERROR: 跑官方 CLI 失败: %s" % e)
+        return 1
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or not os.path.isfile(tmp_read):
+        print(out[-900:])
+        print("ERROR: 读回 Flash 失败(上面 Error 那行是原因; 没插探针也会这样)。")
+        return 1
+    b = open(tmp_read, "rb").read()
+    n = min(len(data), len(b))
+    diffs = [i for i in range(n) if data[i] != b[i]]
+    ok = (not diffs) and len(data) == len(b)
+    jset(elf=elf, base=base, size=size, diff_bytes=len(diffs), match=ok)
+    if ok:
+        print("VERIFY OK: 板子固件与 %s 完全一致。" % os.path.basename(elf))
+        return 0
+    print("!! VERIFY FAIL: 板子上的固件和 %s 不一样。" % os.path.basename(elf))
+    print("   ---- 这就是坑#9(板子在跑旧固件), 先别查代码, 先把烧录搞对 ----")
+    if len(data) != len(b):
+        print("   长度不一致: ELF %d vs 板子 %d" % (len(data), len(b)))
+    print("   不同字节: %d / %d" % (len(diffs), n))
+    for i in diffs[:5]:
+        print("   0x%08X: ELF=0x%02X 板子=0x%02X" % (base + i, data[i], b[i]))
+    if len(diffs) > 5:
+        print("   ...")
+    print("   -> 重新烧: %s %s flash --elf %s" % (sys.executable or "python", os.path.abspath(__file__), elf))
+    return 1
+
+
 def cmd_verify(args):
     """校验板子上的固件与 ELF 是否一致(坑#9: 板子跑旧固件是最常见的假 bug)。"""
+    kind = probe_for_work()
+    if kind == "stlink":
+        return _verify_stlink(args)
+    if kind == "daplink":
+        print("!! DAPLink 这条路的独立校验还没做。")
+        print("   烧录自带逐字节校验: flash 成功就是验过的; 要单独再验一次:")
+        print("   装 pyOCD 后 pyocd commander -t <型号> -c \"read32 0x08000000\" (或用 ST-Link/J-Link 交叉验证)。")
+        return 1
     elf = args.elf or infer_elf()
     if not elf or not os.path.isfile(elf):
         print("ERROR: 未找到 ELF。请 --elf 指定。")
@@ -1774,7 +2614,12 @@ def cmd_verify(args):
 
 
 def cmd_reset(args):
-    """复位并运行目标。"""
+    """复位并运行目标。按探针选路: J-Link 走 Commander 脚本, ST-Link 走官方 CLI。"""
+    kind = probe_for_work()
+    if kind == "stlink":
+        return _reset_stlink(args)
+    if kind == "daplink":
+        return _reset_openocd(args, "daplink")
     dev = resolve_device(args, args.elf or infer_elf())
     # * `g` 与 `q` 之间必须有 Sleep(坑#80): 没 Sleep 时 J-Link 会在 MCU 还没跑起来
     #   就关掉会话, 核停在复位态 —— 现象是"复位完串口/485 一点反应都没有"。
@@ -1907,6 +2752,189 @@ def cmd_selftest(args):
         else:
             print("  [skip] 本机没有 %s 的 SVD, 跳过解析自检" % dev0)
 
+    # 10) 探针层(换 J-Link / ST-Link / DAPLink 的地基): 归一化 / 能力表 / 配置 / 各后端命令
+    chk("_norm_probe 认得出三种调试器的各种叫法",
+        _norm_probe("ST-Link V3") == "stlink" and _norm_probe("stlinkv3set") == "stlink"
+        and _norm_probe("cmsis-dap") == "daplink" and _norm_probe("CMSIS DAP") == "daplink"
+        and _norm_probe("J-Link") == "jlink" and _norm_probe("") == "" and _norm_probe("乱写的") == "",
+        "ST-Link V3 -> %s" % _norm_probe("ST-Link V3"))
+    chk("三种调试器都有能力表(name/caps/best/notes/tools)",
+        sorted(PROBE_DEFS.keys()) == ["daplink", "jlink", "stlink"]
+        and all(k in PROBE_DEFS[p] and PROBE_DEFS[p][k] for p in PROBE_DEFS
+                for k in ("name", "caps", "best", "notes", "tools", "degrade")))
+    chk("能力表 >= 12 项且 caps 是键值表",
+        len(CAP_LABELS) >= 12 and all(isinstance(PROBE_DEFS[p]["caps"], dict) and PROBE_DEFS[p]["caps"]
+                                      for p in PROBE_DEFS),
+        "%d 项能力" % len(CAP_LABELS))
+    chk("_ocd_target 认系列, 认不出给 None(不猜)",
+        _ocd_target("STM32G431CBT6") == "stm32g4x" and _ocd_target("STM32F103C8T6") == "stm32f1x"
+        and _ocd_target("STM32H743VIT6") == "stm32h7x" and _ocd_target("ATMEGA328P") is None)
+    chk("_stlink_conn 拼官方 CLI 连接串",
+        _stlink_conn() == "port=SWD freq=8000" and "sn=602711039" in _stlink_conn("602711039")
+        and "mode=UR" in _stlink_conn("", 8000, "UR"), _stlink_conn("602711039", 8000, "UR"))
+    chk("_flash_from_code 按容量码(第 11 位)取容量",
+        _flash_from_code("STM32G431CBT6") == "128K" and _flash_from_code("STM32H743VIT6") == "2048K"
+        and _flash_from_code("STM32F103C8") == "64K",
+        "G431CBT6 -> %s" % _flash_from_code("STM32G431CBT6"))
+    dcfg = tempfile.mkdtemp(prefix="stm32-dev-cfg-")
+    save_config({"probe": "stlink", "serial": "0421"}, dcfg)
+    cfg = load_config(dcfg)
+    chk("工程配置 probe/serial 能存能读",
+        cfg.get("probe") == "stlink" and cfg.get("serial") == "0421" and os.path.isfile(config_file(dcfg)),
+        str(cfg))
+    if os.path.isfile(config_file(dcfg)):
+        os.remove(config_file(dcfg))
+    try:
+        os.rmdir(dcfg)
+    except OSError:
+        pass
+    pa = _A()
+    pa.probe = "stlink"
+    pa.serial = ""
+    chk("resolve_probe: --probe 优先", resolve_probe(pa)[0] == "stlink")
+    pa.probe = "瞎写的"
+    try:
+        resolve_probe(pa)
+        chk("resolve_probe: 认不出的探针必须报错", False, "居然没报错")
+    except SkillError:
+        chk("resolve_probe: 认不出的探针必须报错", True)
+    ocd = find_openocd()
+    if ocd:
+        s1 = " ".join(_ocd_prog_argv("daplink", "ABC123", "STM32G431CBT6") or [])
+        chk("DAPLink: cmsis-dap 接口 + adapter serial + 系列脚本",
+            "interface/cmsis-dap.cfg" in s1 and "adapter serial ABC123" in s1
+            and "target/stm32g4x.cfg" in s1, s1)
+        s2 = " ".join(_ocd_prog_argv("stlink", "", "STM32G431CBT6") or [])
+        chk("ST-Link: stlink 接口 + 不塞串号",
+            "interface/stlink.cfg" in s2 and "adapter serial" not in s2, s2)
+    else:
+        print("  [skip] 没装 openocd, 跳过 OpenOCD 命令行自检")
+    chk("本机 ST 官方 CLI / Cube 包 / 探针工具盘点不崩",
+        isinstance(find_stm32_cli(), (str, type(None))) and isinstance(find_cube_pack("STM32G431CB") , (str, type(None))))
+
+    if ocd:
+        rc = " ".join(_ocd_rtt_argv(ocd, "stlink", "", "STM32G431CBT6", 0x20000000, 0x400, 9090, 0) or [])
+        chk("OpenOCD RTT: setup/start/server 三段齐全, 且 resume 用 catch 兜住",
+            'rtt setup 0x20000000 0x400 "SEGGER RTT"' in rc and "rtt start" in rc
+            and "rtt server start 9090 0" in rc and "catch {resume}" in rc, rc)
+        rd = " ".join(_ocd_rtt_argv(ocd, "daplink", "ABC123", "STM32F103C8T6", 0x20000000, 0x20000, 9091, 1) or [])
+        chk("OpenOCD RTT: DAPLink 用 cmsis-dap + 带串号 + F1 系列脚本",
+            "interface/cmsis-dap.cfg" in rd and "adapter serial ABC123" in rd
+            and "target/stm32f1x.cfg" in rd, rd)
+        chk("OpenOCD RTT: 认不出的芯片必须返回 None(不许瞎编 target 脚本)",
+            _ocd_rtt_argv(ocd, "stlink", "", "ATMEGA328P", 0, 0x400, 9090, 0) is None)
+
+    class _A:
+        pass
+    a = _A()
+    a.address = None
+    a.search = None
+    a.rtt_port = 0
+    chk("RTT 地址窗口: 没 ELF 符号时退回全 RAM 搜索窗口",
+        _rtt_addr_span(a, "") == (0x20000000, 0x20000), str(_rtt_addr_span(a, "")))
+    a.address = "0x20000BA4"
+    chk("RTT 地址窗口: --address 优先且窗口开小",
+        _rtt_addr_span(a, "") == (0x20000BA4, 0x400), str(_rtt_addr_span(a, "")))
+    a.address = "乱写"
+    chk("RTT 地址窗口: 地址写错返回 None(不许崩)", _rtt_addr_span(a, "") is None)
+    a.address = None
+    chk("RTT TCP 端口: 默认 9090", _rtt_tcp_port(a) == 9090)
+    a.rtt_port = 9500
+    chk("RTT TCP 端口: --rtt-port 生效", _rtt_tcp_port(a) == 9500)
+    # 地址自愈靠"抓包文件是不是空的"来判定, 这个判定错了会白白重抓或者漏重抓。
+    _empt = os.path.join(tempfile.gettempdir(), "stm32-dev-selftest-empty.log")
+    with io.open(_empt, "wb") as fh:
+        fh.write(b"\xef\xbb\xbf \r\n\t")
+    chk("RTT 自愈: 只有空白/BOM 算没抓到", _rtt_empty(_empt) is True)
+    with io.open(_empt, "w", encoding="utf-8") as fh:
+        fh.write("RTT seq=1\r\n")
+    chk("RTT 自愈: 有数据就不算空", _rtt_empty(_empt) is False)
+    os.remove(_empt)
+    chk("RTT 自愈: 文件根本不存在也算空(不许崩)",
+        _rtt_empty(os.path.join(tempfile.gettempdir(), "stm32-dev-no-such-file.log")) is True)
+    chk("RTT 自愈: 默认搜索范围是 RAM 段",
+        _RTT_SEARCH_DEFAULT.startswith("0x2") and " " in _RTT_SEARCH_DEFAULT, _RTT_SEARCH_DEFAULT)
+
+    # 工具链自动配置: 安装命令必须对应实测存在的包 ID, 编一个不存在的 ID 会白等一场。
+    _oc = _sys_install_cmds("openocd")
+    chk("自动安装: openocd 有安装命令(包 ID 实测存在)",
+        bool(_oc) and any(("xpack-dev-tools.openocd-xpack" in x) or (x == "openocd") for x in _oc), str(_oc))
+    _gcc = _sys_install_cmds("gcc")
+    chk("自动安装: 编译器有安装命令",
+        bool(_gcc) and any(("Arm.GnuArmEmbeddedToolchain" in x) or (x == "gcc-arm-none-eabi") for x in _gcc), str(_gcc))
+    chk("自动安装: 没把握的东西不乱装(返回空)", _sys_install_cmds("something-else") == [])
+    # 主动建议: 每种探针都要说清"还能做什么", 探针无关的三条永远在。
+    _pj = _proactive_lines("jlink")
+    _ps = _proactive_lines("stlink")
+    _pd = _proactive_lines("daplink")
+    _pu = _proactive_lines("")
+    chk("主动建议: J-Link 提到 RTT 与下行回灌",
+        any(("rtt --elf" in x) for x in _pj) and any(("rtt-send" in x) for x in _pj))
+    chk("主动建议: ST-Link 提到选项字节与 -hf",
+        any(("mode=UR" in x) for x in _ps) and any(("-hf" in x) for x in _ps))
+    chk("主动建议: DAPLink 提到 pyOCD", any(("pyocd" in x.lower()) for x in _pd))
+    chk("主动建议: 没定探针时先提示去探测", any(("probe detect" in x) for x in _pu), str(_pu))
+    chk("主动建议: 四类都给探针无关的三条(串口/黑匣子/DWT)",
+        all(any(("serial --port" in x) for x in v) and any(("blackbox" in x) for x in v)
+            and any(("DWT" in x) for x in v) for v in (_pj, _ps, _pd, _pu)))
+    # setup 的开关: --install 必须是真开关, 否则"缺啥自动装"是句空话。
+    _ap = build_parser().parse_args(["setup", "--install"])
+    chk("setup --install 开关存在(隐含 --fix)", _ap.install is True and _ap.fix is False)
+
+    # --dry-run: 第一次烧接电机的板子时必须能"只看不跑"。这条错了会真的动板子。
+    chk("dry-run: 默认是关的(不许默默变成不执行)", _DRY_RUN is False)
+    globals()["_DRY_RUN"] = True        # 强制打开, 只测这个开关本身
+    _blocked = False
+    try:
+        _dry_stop(["echo", "hi"])
+    except _DryRun:
+        _blocked = True
+    globals()["_DRY_RUN"] = False
+    chk("dry-run: 打开后 _dry_stop 会拦住执行(且抛出可被 main 接住)", _blocked is True)
+    _pdf = build_parser().parse_args(["flash", "--dry-run"])
+    _pdr = build_parser().parse_args(["reset", "--dry-run"])
+    chk("dry-run: flash / reset 都有开关", _pdf.dry_run is True and _pdr.dry_run is True)
+
+    # 裸地址读写: 没有 SVD 的东西(DWT / ITM / SCB / TPIU)也必须能读能写
+    chk("裸地址: 默认按 4 字节读", _read_expr("0xE000ED00") == "*(volatile unsigned int *)0xE000ED00")
+    chk("裸地址: --size 1/2/8 换宽度",
+        _read_expr("0x20000000", 1).startswith("*(volatile unsigned char *)")
+        and _read_expr("0x20000000", 2).startswith("*(volatile unsigned short *)")
+        and _read_expr("0x20000000", 8).startswith("*(volatile unsigned long long *)"))
+    chk("裸地址: 符号名原样透传", _read_expr("g_bb") == "g_bb" and _write_expr("uwTick") == "uwTick")
+    chk("裸地址: 写用同一种左值形式", _write_expr("0xE000EDF0") == "*(volatile unsigned int *)0xE000EDF0")
+    chk("裸地址: read/write 都有 --size",
+        build_parser().parse_args(["read", "--size", "2", "0xE000ED00"]).size == 2
+        and build_parser().parse_args(["write", "x=1"]).size == 4)
+
+    # 恢复运行: 换探针后命令不一样; 写死 monitor go 会让 ST-Link/DAPLink 的 continue 直接失败
+    _oldp = _PROBE
+    globals()["_PROBE"] = "stlink"
+    _rs = _resume_cmd()
+    globals()["_PROBE"] = "daplink"
+    _rd = _resume_cmd()
+    globals()["_PROBE"] = "jlink"
+    _rj = _resume_cmd()
+    globals()["_PROBE"] = _oldp
+    chk("恢复运行: ST-Link/DAPLink 用 monitor resume, J-Link 用 monitor go",
+        _rs == "monitor resume" and _rd == "monitor resume" and _rj == "monitor go")
+
+    # --- RTT 下行(rtt-send)也通用了: J-Link 走 pylink, ST-Link/DAPLink 走 OpenOCD 的双向 rtt server ---
+    chk("--hex 能吃逗号与 0x 前缀", _rtt_hex_bytes("70,0A") == b"\x70\x0a" and _rtt_hex_bytes("0x70 0x0a") == b"\x70\x0a")
+    chk("--hex 乱写返回 None(不崩)", _rtt_hex_bytes("zz") is None and _rtt_hex_bytes("") is None)
+    _rsend = build_parser().parse_args(["rtt-send", "hi", "--probe", "stlink"])
+    chk("rtt-send 有 --channel / --rtt-port", _rsend.channel == 0 and _rsend.rtt_port == 9090)
+    chk("rtt-send 三件套在位",
+        all(callable(globals().get(n)) for n in ("_rtt_send_ocd", "_ocd_start_rtt", "_ocd_finish", "_tail_text", "_fetch_rtt_sources")))
+    chk("init-rtt 有 --offline", build_parser().parse_args(["init-rtt"]).offline is False)
+    _rtt_paths = dict((n, rel) for rel, n in _RTT_REPO_FILES)
+    chk("RTT 官方仓库路径与文件数对",
+        len(_RTT_REPO_FILES) == 6
+        and _rtt_paths.get("SEGGER_RTT.c", "").startswith("RTT/")
+        and _rtt_paths.get("SEGGER_RTT_ASM_ARMv7M.S", "").startswith("RTT/")
+        and _rtt_paths.get("SEGGER_RTT_Conf.h") == "Config/SEGGER_RTT_Conf.h")
+    chk("init-rtt --offline 时不去联网", _fetch_rtt_sources(tempfile.gettempdir(), offline=True) == [])
+
     print("SELFTEST: %s" % ("PASS" if ok else "FAIL"))
     jset(checks=checks, result=("PASS" if ok else "FAIL"))
     return 0 if ok else 1
@@ -1942,13 +2970,59 @@ def _do_verify(elf, dev):
                           else "板子固件与 ELF 不一致(%d 字节不同)" % diffs)
 
 
+_RTT_REPO_RAW = "https://raw.githubusercontent.com/SEGGERMicro/RTT/main/"
+
+_RTT_REPO_FILES = [
+    ("RTT/SEGGER_RTT.c", "SEGGER_RTT.c"),
+    ("RTT/SEGGER_RTT.h", "SEGGER_RTT.h"),
+    ("RTT/SEGGER_RTT_printf.c", "SEGGER_RTT_printf.c"),
+    ("RTT/SEGGER_RTT_ASM_ARMv7M.S", "SEGGER_RTT_ASM_ARMv7M.S"),
+    ("RTT/SEGGER_RTT_ConfDefaults.h", "SEGGER_RTT_ConfDefaults.h"),
+    ("Config/SEGGER_RTT_Conf.h", "SEGGER_RTT_Conf.h"),
+]
+
+
+def _fetch_rtt_sources(dst, verbose=False, offline=False):
+    """从 SEGGER 官方仓库(BSD 许可)取 RTT 源码。返回已写入的文件名; 关键文件没拿到就返回 []。
+
+    路径按仓库实际布局: RTT/ 下是 .c/.h 与汇编加速件, Config/ 下是 SEGGER_RTT_Conf.h。
+    """
+    if offline:
+        print("   --offline: 跳过联网下载。")
+        return []
+    import urllib.request
+    got = []
+    for rel, name in _RTT_REPO_FILES:
+        url = _RTT_REPO_RAW + rel
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                data = resp.read()
+            if not data:
+                raise ValueError("空文件")
+            with open(os.path.join(dst, name), "wb") as fh:
+                fh.write(data)
+            got.append(name)
+            if verbose:
+                print("   %-28s <- %s (%d 字节)" % (name, rel, len(data)))
+        except Exception as e:
+            print("   [没取到] %s: %s" % (name, e))
+    need = ("SEGGER_RTT.c", "SEGGER_RTT.h")
+    if not all(n in got for n in need):
+        return []
+    print("从官方仓库取到 %d 个文件: %s" % (len(got), _RTT_REPO_RAW))
+    return got
+
 def cmd_init_rtt(args):
-    """把 SEGGER RTT 源码放进工程(J-Link 安装目录自带则直接复制, 否则给出获取方式)。"""
+    """把 SEGGER RTT 源码放进工程: 先看 J-Link 安装目录自带没, 没有再联网从官方仓库取。
+
+    与探针无关 —— RTT 是固件侧的事, 三种调试器都能用(抓包通道不同: J-Link 原生 / 其余走 OpenOCD)。
+    """
     d = args.dir or "."
     dst = os.path.join(d, args.subdir)
     os.makedirs(dst, exist_ok=True)
     want = ["SEGGER_RTT.c", "SEGGER_RTT.h", "SEGGER_RTT_Conf.h",
-            "SEGGER_RTT_ConfDefaults.h", "SEGGER_RTT_printf.c"]
+            "SEGGER_RTT_ConfDefaults.h", "SEGGER_RTT_printf.c",
+            "SEGGER_RTT_ASM_ARMv7M.S"]
     src_dir = None
     for base in WINDOWS_JLINK_DIRS + UNIX_JLINK_DIRS:
         if not os.path.isdir(base):
@@ -1968,9 +3042,12 @@ def cmd_init_rtt(args):
                 copied.append(name)
         print("从 J-Link 安装目录复制 RTT 源码: %s" % src_dir)
     if not copied:
-        print("!! J-Link 安装目录里没找到 RTT 源码(新版安装包常不含)。")
-        print("   请从 SEGGER 官方仓库取(BSD 许可): https://github.com/SEGGERMicro/RTT")
-        print("   需要: " + ", ".join(want) + "  (RTT/ 与 Config/ 两个目录下)")
+        print("!! J-Link 安装目录里没找到 RTT 源码(新版安装包常不含) -> 改从 SEGGER 官方仓库取。")
+        copied = _fetch_rtt_sources(dst, verbose=args.verbose, offline=args.offline)
+    if not copied:
+        print("   手动取法(BSD 许可): https://github.com/SEGGERMicro/RTT")
+        print("   需要: " + ", ".join(want))
+        print("         .c/.h 与汇编件在 RTT/ 下, SEGGER_RTT_Conf.h 在 Config/ 下")
         return 1
     print("已复制到 %s:" % dst)
     for n in copied:
@@ -2106,6 +3183,13 @@ def cmd_svd(args):
                 rhit = k
                 break
         if rhit is None:
+            # ST 的 SVD 常用扁平名(外设_寄存器, 如 RCC 下的 RCC_CFGR), 允许只写短名。
+            alt = "%s_%s" % (hit, rname)
+            for k in regs:
+                if k.upper() == alt.upper():
+                    rhit = k
+                    break
+        if rhit is None:
             print("SVD 里 %s 没有寄存器 %s。可用示例: %s"
                   % (hit, rname, ", ".join(sorted(regs)[:15])))
             return 1
@@ -2164,16 +3248,203 @@ def _unescape(s):
     return bytes(out)
 
 
-def cmd_rtt_send(args):
-    """向 RTT 下行通道发数据(可选依赖: pip install pylink-square)。
+def _rtt_hex_bytes(s):
+    """把 "70,0A" / "70 0a" / "0x70 0x0a" 都吃成字节; 解析不了返回 None。"""
+    if not s:
+        return None
+    try:
+        return bytes.fromhex(re.sub(r"0[xX]|,", " ", s))
+    except ValueError:
+        return None
 
-    固件侧用 SEGGER_RTT_HasKey()/SEGGER_RTT_GetKey() 取; 与 GDB server 互斥。
+
+def _tail_text(path, n=6):
+    """读文件末尾 n 行(读不到就返回空串)。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+        return " | ".join(lines[-n:])
+    except Exception:
+        return ""
+
+
+def _ocd_start_rtt(argv, port, logfile):
+    """起一个 openocd, 等它的 RTT server 把 TCP 端口挂上。
+
+    返回 (proc, sk, before_pids); 失败返回 (proc, None, before) —— 调用方负责收场。
+    注意: Windows 下 openocd 常是 .cmd 包装件(cmd /c), 只杀 cmd 会留下 openocd.exe 占着探针,
+    所以同时记下启动前已存在的 openocd pid, 收场时杀差集。
     """
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name == "nt":
+        flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    before = set(_pids_of("openocd"))
+    lf = open(logfile, "wb")
+    proc = subprocess.Popen(argv, stdout=lf, stderr=subprocess.STDOUT, creationflags=flags)
+    sk = None
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            sk = socket.create_connection(("127.0.0.1", port), 0.5)
+            break
+        except OSError:
+            time.sleep(0.3)
+    proc._sd_log = lf          # 挂在对象上, 收场时一起关
+    return (proc, sk, before)
+
+
+def _ocd_finish(proc, sk, before):
+    """收场: 关 socket、杀 openocd 及其子进程、关日志句柄。"""
+    try:
+        if sk is not None:
+            sk.close()
+    except OSError:
+        pass
+    if proc is not None:
+        _kill_pid(proc.pid)
+        for pid in (set(_pids_of("openocd")) - before):
+            _kill_pid(pid)
+        lf = getattr(proc, "_sd_log", None)
+        if lf is not None:
+            try:
+                lf.close()
+            except Exception:
+                pass
+
+
+def _rtt_send_ocd(args, probe):
+    """ST-Link / DAPLink 发 RTT 下行(往目标写): 用 OpenOCD 的 rtt server。
+
+    OpenOCD 的 rtt server 是双向的(源码 src/server/rtt_server.c): 目标上行 -> socket,
+    我们写 socket -> 目标的下行缓冲(rtt_write_channel)。所以 RTT 下行不是 J-Link 独有。
+    固件侧仍然要 SEGGER_RTT_HasKey()/SEGGER_RTT_GetKey() 把数据取走。
+    """
+    elf = args.elf or infer_elf()
+    dev = resolve_device(args, elf)
+    span = _rtt_addr_span(args, elf)
+    if span is None:
+        print("ERROR: 地址解析失败(要 0x 开头的十六进制): %s" % (args.address or ""))
+        return 1
+    addr, size = span
+    ocd = find_openocd()
+    if not ocd:
+        print("ERROR: 找不到 OpenOCD —— ST-Link/DAPLink 的 RTT 下行靠它。装法见 SETUP.md, 或设 OPENOCD 环境变量。")
+        return 1
+    sn = args.serial or _SERIAL or ""
+    port = _rtt_tcp_port(args)
+    channel = getattr(args, "channel", 0)
+    argv = _ocd_rtt_argv(ocd, probe, sn, dev, addr, size, port, channel)
+    if not argv:
+        print("ERROR: 认不出 %s 属于哪个 STM32 系列, OpenOCD 需要 -f target/<系列>x.cfg。" % dev)
+        print("       -> 用 --device STM32G431CBT6 这样的完整订货号, 或给 --elf。")
+        return 1
+    payload = _rtt_hex_bytes(args.hex) if args.hex else _unescape(args.data or "")
+    if not payload:
+        print("ERROR: 没有要发送的数据(--data 或 --hex)。")
+        return 1
+    for srv in (JLinkServer(dev, GDB_PORT, sn), OpenOCDServer(dev, GDB_PORT, sn, probe)):
+        try:
+            if srv.is_up():
+                print("检测到常驻 GDB server -> 先 stop(它和 RTT 抢同一台探针)")
+                srv.stop()
+                time.sleep(0.5)
+        except Exception:
+            pass
+    logfile = os.path.join(tempfile.gettempdir(), "stm32-dev-openocd-rtt.log")
+    try:
+        os.remove(logfile)
+    except OSError:
+        pass
+    print("== RTT 下行(OpenOCD + %s): device=%s channel=%d, 发 %d 字节 x%d =="
+          % (PROBE_DEFS.get(probe, {}).get("name", probe), dev, channel, len(payload), max(1, args.repeat)))
+    print("   " + " ".join(argv))
+    proc, sk, before = _ocd_start_rtt(argv, port, logfile)
+    rc = 1
+    try:
+        if sk is None:
+            print("!! OpenOCD 没能把 RTT 服务挂到 127.0.0.1:%d(进程%s)。"
+                  % (port, "已退出" if proc.poll() is not None else "还在跑"))
+            tail = _tail_text(logfile)
+            if tail:
+                print("   后台日志: %s" % tail)
+            else:
+                print("   后台日志是空的(openocd 被强杀时缓冲没落盘)。手动跑一遍看现场:")
+                print("     " + " ".join(argv))
+            print("   常见原因: 控制块地址不对(板子跑的不是这份 ELF, 坑#9) / 核停在 halt / 探针被别的程序占着。")
+        else:
+            print("已连上 RTT 通道 %d; 固件里要用 SEGGER_RTT_HasKey()/SEGGER_RTT_GetKey() 取, 没取就被丢弃。" % channel)
+            sk.settimeout(0.2)
+            drain_end = time.time() + 0.4       # 先排掉环形缓冲里的旧数据, 免得 --expect 匹到开机日志
+            while time.time() < drain_end:
+                try:
+                    if not sk.recv(4096):
+                        break
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+            expect = re.compile(args.expect) if args.expect else None
+            hits = 0
+            for i in range(max(1, args.repeat)):
+                t0 = time.perf_counter()
+                sk.sendall(payload)
+                buf = b""
+                deadline = time.time() + max(0.2, args.timeout)
+                while expect and time.time() < deadline:
+                    try:
+                        chunk = sk.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if expect.search(buf.decode("utf-8", "replace")):
+                        break
+                ms = (time.perf_counter() - t0) * 1000
+                txt = buf.decode("utf-8", "replace").strip()
+                if expect:
+                    if expect.search(txt):
+                        hits += 1
+                        print("[%d/%d] %.1f ms 命中: %s" % (i + 1, args.repeat, ms, txt[-200:]))
+                    else:
+                        print("[%d/%d] %.1f ms 未命中: %s" % (i + 1, args.repeat, ms, txt[-120:] or "<无数据>"))
+                else:
+                    print("[%d/%d] 已发 %d 字节%s"
+                          % (i + 1, args.repeat, len(payload), ("" if not txt else "; 回包: " + txt[-200:])))
+                if args.interval > 0 and i + 1 < args.repeat:
+                    time.sleep(args.interval / 1000.0)
+            if expect:
+                print("命中 %d/%d" % (hits, args.repeat))
+                jset(sent=args.repeat, hits=hits)
+                rc = 0 if hits == args.repeat else 1
+            else:
+                jset(sent=args.repeat, bytes=len(payload))
+                rc = 0
+    finally:
+        _ocd_finish(proc, sk, before)
+    return rc
+
+def cmd_rtt_send(args):
+    """向 RTT 下行通道发数据(往目标写)。
+
+    J-Link: pylink-square 直连 DLL(可选依赖: pip install pylink-square)。
+    ST-Link / DAPLink: 走 OpenOCD 的 rtt server(TCP 双向, 见 _rtt_send_ocd)。
+    固件侧用 SEGGER_RTT_HasKey()/SEGGER_RTT_GetKey() 取; 与常驻 GDB server 抢同一台探针(自动先停)。
+    """
+    probe = probe_for_work()
+    if probe in ("stlink", "daplink"):
+        return _rtt_send_ocd(args, probe)
     try:
         import pylink
     except ImportError:
-        print("ERROR: 需要 pylink-square -> pip install pylink-square")
-        print("       替代: 起 RTT server 后用 JLinkRTTClient(默认 localhost:19021) 手动交互")
+        print("ERROR: J-Link 的 RTT 下行要 pylink-square -> pip install pylink-square")
+        print("       替代一: ST-Link/DAPLink 不用 pylink, 直接 rtt-send(走 OpenOCD)")
+        print("       替代二: 起 RTT server 后用 JLinkRTTClient(默认 localhost:19021) 手动交互")
         return 1
     elf = args.elf or infer_elf()
     dev = resolve_device(args, elf)
@@ -2183,7 +3454,7 @@ def cmd_rtt_send(args):
         if sym:
             addr = "0x%08X" % sym
     _warn_stale_jlink()
-    payload = bytes.fromhex(args.hex) if args.hex else _unescape(args.data or "")
+    payload = _rtt_hex_bytes(args.hex) if args.hex else _unescape(args.data or "")
     if not payload:
         print("ERROR: 没有要发送的数据(--data 或 --hex)。")
         return 1
@@ -2258,11 +3529,1602 @@ def cmd_rtt_send(args):
             pass
 
 
+# ---------------------------------------------------------------------------
+# 调试器(探针)选型层: 命令层不写死型号, 只问"这个探针能不能做 X"
+#   优先级: --probe > 环境变量 STM32_DEV_PROBE > 工程根 .stm32-dev.json > 自动探测
+# ---------------------------------------------------------------------------
+def _which_or_dirs(names, dirs, env=None):
+    """env 变量 > PATH > 常见安装目录; 找不到返回 None(不抛异常)。"""
+    if env:
+        v = os.environ.get(env)
+        if v:
+            if os.path.isfile(v):
+                return v
+            p = shutil.which(v)
+            if p:
+                return p
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    for d in dirs:
+        for n in names:
+            cand = os.path.join(d, n)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _glob_first(patterns):
+    """按 glob 找第一个存在的文件; 版本号大的优先。"""
+    hits = []
+    for pat in patterns:
+        hits.extend(glob.glob(os.path.expanduser(pat)))
+    for h in sorted(set(hits), reverse=True):
+        if os.path.isfile(h):
+            return h
+    return None
+
+
+def find_stm32_cli():
+    """STM32_Programmer_CLI: 烧录+逐字节校验+选项字节+HardFault 分析(ST 官方)。"""
+    env = os.environ.get("STM32_PROGRAMMER_CLI")
+    if env and os.path.isfile(env):
+        return env
+    for n in ("STM32_Programmer_CLI", "STM32_Programmer_CLI.exe", "STM32_Programmer.sh"):
+        p = shutil.which(n)
+        if p:
+            return p
+    return _glob_first([
+        "C:/ST/STM32CubeCLT_*/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+        "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+        "C:/Program Files (x86)/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+        "/opt/st/stm32cubeclt_*/STM32CubeProgrammer/bin/STM32_Programmer_CLI",
+        "/usr/local/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI",
+    ])
+
+
+def find_openocd():
+    """OpenOCD: 多探针通用的 gdb server, 也是非 J-Link 探针跑 RTT/SWO 的唯一通道。"""
+    env = os.environ.get("OPENOCD")
+    if env and os.path.isfile(env):
+        return env
+    for n in ("openocd", "openocd.exe", "openocd.cmd", "openocd.bat"):
+        p = shutil.which(n)
+        if p:
+            return p
+    return _glob_first([
+        "~/.local/bin/openocd*",
+        "~/.local/share/xpack*/bin/openocd*",
+        "~/AppData/Local/Microsoft/WinGet/Links/openocd*",
+        "/usr/bin/openocd", "/usr/local/bin/openocd", "/opt/homebrew/bin/openocd",
+    ])
+
+
+def find_stlink_gdbserver():
+    """ST-LINK_gdbserver: ST 官方 gdb server(半主机 / SWO 时钟分频)。"""
+    env = os.environ.get("STLINK_GDB_SERVER")
+    if env and os.path.isfile(env):
+        return env
+    for n in ("ST-LINK_gdbserver", "ST-LINK_gdbserver.exe"):
+        p = shutil.which(n)
+        if p:
+            return p
+    return _glob_first([
+        "C:/ST/STM32CubeCLT_*/STLink-gdb-server/bin/ST-LINK_gdbserver.exe",
+        "C:/Program Files/STMicroelectronics/STLink-gdb-server/bin/ST-LINK_gdbserver.exe",
+        "/opt/st/stm32cubeclt_*/STLink-gdb-server/bin/ST-LINK_gdbserver",
+    ])
+
+
+def find_pyocd():
+    """pyOCD: 可选, 列 CMSIS-DAP 探针 / 烧录更省事。"""
+    env = os.environ.get("PYOCD")
+    if env and os.path.isfile(env):
+        return env
+    for n in ("pyocd", "pyocd.exe"):
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+PROBE_ALIASES = [
+    ("jlink", ["jlink", "j-link", "segger", "jlinkv9", "jlinkv11", "jl"]),
+    ("stlink", ["stlink", "st-link", "stlinkv2", "stlinkv3", "stlinkv3set", "stlinkv3mini",
+                "stlinkv3minie", "v3set", "v3mini", "v3minie", "st"]),
+    ("daplink", ["daplink", "dap", "cmsisdap", "cmsis-dap", "pyocd", "mbed", "picoprobe",
+                 "link", "microbit", "c251"]),
+]
+
+CAP_LABELS = [
+    ("flash", "烧录"),
+    ("flash_verify", "烧后逐字节校验"),
+    ("rtt_up", "RTT 实时日志(探针拉)"),
+    ("rtt_down", "RTT 回灌(主机->目标)"),
+    ("swo", "SWO/ITM trace"),
+    ("vcp", "虚拟串口"),
+    ("option_bytes", "选项字节/读保护"),
+    ("recover", "救砖(UR/HOTPLUG)"),
+    ("fault_analysis", "官方 HardFault 分析"),
+    ("semihosting", "半主机"),
+    ("multi_probe", "多探针选号"),
+    ("swd_clock", "SWD 时钟上限"),
+]
+
+PROBE_DEFS = {
+    "jlink": {
+        "name": "SEGGER J-Link",
+        "matches": ["J-Link", "J-Link V9/V10/V11", "J-Link EDU/PLUS"],
+        "caps": {
+            "flash": "JLink.exe Commander(loadfile + 刷后校验)",
+            "flash_verify": "可选(先 readback 再比)",
+            "rtt_up": "native: 探针直接读 RAM 环缓冲, MB/s 级",
+            "rtt_down": "native: JLinkRTTClient 端口 19021",
+            "swo": "完整(SWO + 并行 trace)",
+            "vcp": "无(J-Link 不带串口)",
+            "option_bytes": "要自己拼 Commander 脚本",
+            "recover": "一般(靠复位策略)",
+            "fault_analysis": "无(自己读 CFSR/HFSR)",
+            "semihosting": "GDB + SEGGER 半主机",
+            "multi_probe": "USB=<序列号>",
+            "swd_clock": "最高(默认给 4000kHz, 可上万)",
+        },
+        "best": "RTT 实时双向日志(唯一能边跑边高速读日志的), 跨厂商芯片全支持, 多探针选号稳, 量产/多核生态最全。",
+        "notes": [
+            "J-Link 驱动用 SEGGER 私有栈, openocd 用 libusb, 二者同时抢同一根 J-Link 会 LIBUSB_ERROR_NOT_FOUND; 用哪个探针就只开哪条通道。",
+            "JLinkGUIServer/JLinkRemoteServer 会残留(技能里要 taskkill, 否则下次连不上)。",
+            "RTT Logger 与 JLinkGDBServerCL 互斥(同一台 J-Link 只能被一个进程独占); 抓 RTT 前必须先 stop 掉常驻 server。",
+            "RTT 要固件侧集成 SEGGER RTT 源码(技能 init-rtt 就是干这个), 探针自带 RTT 不等于目标能用。",
+            "J-Link 自动搜索 RTT 控制块在本板会失败(报 RTT Control Block not found), 必须给 --address(ELF 里 _SEGGER_RTT 的地址)。",
+            "EDU 版本授权禁止商用; 商业产品要 Base/Plus 级。",
+        ],
+        "degrade": "没有 J-Link 时: 烧录/复位走 ST-Link 或 DAPLink(OpenOCD); RTT 换 OpenOCD 的 rtt(吞吐降 1~2 个数量级, 丢帧判定要打折)。",
+        "tools": [
+            ("jlink_gdbserver", "JLinkGDBServerCL(gdb server)", find_jlink_server, "装 SEGGER J-Link 驱动, 或设 JLINK_GDB_SERVER"),
+            ("jlink_rtt", "JLinkRTTLogger(RTT 抓包)", find_rtt_logger, "同上; 新安装包缺它就换 OpenOCD rtt"),
+            ("jlink_exe", "JLink.exe(烧录/复位/ShowEmuList)", find_jlink_cmd, "装 SEGGER J-Link 驱动"),
+        ],
+    },
+    "stlink": {
+        "name": "ST-Link V2 / V3 (V3SET, V3MINI, V3MINIE)",
+        "matches": ["ST-Link V2", "ST-Link V3SET", "ST-Link V3MINI", "ST-Link V3MINIE", "板载 ST-Link"],
+        "caps": {
+            "flash": "STM32_Programmer_CLI -w(有返回码) 或 OpenOCD program",
+            "flash_verify": "STM32_Programmer_CLI -w -v(官方逐字节校验, 退出码可信)",
+            "rtt_up": "OpenOCD rtt(轮询 RAM, 吞吐低 1~2 个数量级)",
+            "rtt_down": "OpenOCD rtt server 理论可写, 本技能还没接命令/没实测",
+            "swo": "V3 的 SWO 可用, 但 OpenOCD hla 驱动要手配 swo/tpiu(单 AP 限制)",
+            "vcp": "V3 自带虚拟串口(一根 USB 同时给 SWD + 串口)",
+            "option_bytes": "STM32_Programmer_CLI -ob(读保护/BOR/WRP/boot 全支持)",
+            "recover": "最好: -c mode=UR/HOTPLUG + -rdu 读保护救援",
+            "fault_analysis": "自带: STM32_Programmer_CLI -hf 分析 HardFault",
+            "semihosting": "ST-LINK_gdbserver --semihosting 支持",
+            "multi_probe": "-i <序列号> 或 OpenOCD adapter serial",
+            "swd_clock": "V3 SWD 默认 8MHz, JTAG 21.333MHz",
+        },
+        "best": "调 STM32 的官方一等公民: 烧录带逐字节校验和真退出码, 选项字节/读保护/救砖最顺手, 还自带 HardFault 分析器和虚拟串口。",
+        "notes": [
+            "STM32_Programmer_CLI 和 ST-LINK_gdbserver 会抢同一根 ST-Link; 烧录前先停 gdb server。",
+            "本机可能同时存在 ST 的 stlinkserver.exe 和 CubeCLT 里那个, 两个都开就抢设备(现象是时好时坏)。",
+            "克隆/山寨 ST-Link 会被官方 CLI 直接拒(报 not a genuine ST device), 只能退回 OpenOCD。",
+            "OpenOCD 的 hla(ST-Link)驱动有单 AP 限制: SWO/RTT 要手动给 -ap-num/-baseaddr; SWO 时钟配错会让芯片调试口锁死到重新上电。",
+            "OpenOCD RTT 是轮询内存, 抓包丢的行里混着工具侧丢帧, 不能再当固件丢帧证据。",
+            "V3MINI/V3MINIE 是精简版, 是否引出 SWO 引脚要先看板子(只有 SWD 四针时用 RTT/虚拟串口, 别指望 SWO)。",
+            "STM32_Programmer_CLI 只保 ST 自家芯片。",
+        ],
+        "degrade": "没有 ST-Link 时: 烧录/选项字节换 OpenOCD(DAPLink 或 J-Link); 官方 -hf 和 -rdu 这类 ST 专属功能就用不上了。",
+        "tools": [
+            ("stm32_cli", "STM32_Programmer_CLI(烧录/校验/选项字节/-hf)", find_stm32_cli, "装 STM32CubeCLT 或 STM32CubeProgrammer, 或设 STM32_PROGRAMMER_CLI"),
+            ("openocd", "OpenOCD(gdb server + RTT + SWO)", find_openocd, "装 OpenOCD(winget install xpack-openocd), 或设 OPENOCD"),
+            ("stlink_gdbserver", "ST-LINK_gdbserver(可选: 半主机/SWO 分频)", find_stlink_gdbserver, "随 STM32CubeCLT 安装"),
+        ],
+    },
+    "daplink": {
+        "name": "DAPLink / CMSIS-DAP",
+        "matches": ["DAPLink", "CMSIS-DAP", "mbed", "Picoprobe", "Keil ULINK 的 DAP 模式"],
+        "caps": {
+            "flash": "OpenOCD program 或 pyocd flash",
+            "flash_verify": "OpenOCD verify / pyocd 自带校验",
+            "rtt_up": "OpenOCD rtt(同 ST-Link: 轮询, 吞吐低)",
+            "rtt_down": "同 ST-Link: 理论上能回写, 技能没接",
+            "swo": "看固件: 老版 DAPLink 没引出 SWO, v2 固件才有",
+            "vcp": "多数带虚拟串口(固件决定)",
+            "option_bytes": "无 ST 官方支持(要读手册手写 FLASH 寄存器)",
+            "recover": "一般(靠 OpenOCD reset 配置)",
+            "fault_analysis": "无(自己读 CFSR/HFSR 或走 OpenOCD)",
+            "semihosting": "GDB + OpenOCD 半主机",
+            "multi_probe": "OpenOCD cmsis_dap_serial",
+            "swd_clock": "最高到 4~10MHz(看实现)",
+        },
+        "best": "便宜、开源、通吃各家芯片; pyOCD 列探针/烧录最省事, 没有授权限制。",
+        "notes": [
+            "STM32_Programmer_CLI 不认 DAPLink: ST 官方那套(选项字节/-hf/救砖)全都用不了, 只能走 OpenOCD/pyOCD。",
+            "OpenOCD 要显式给 adapter driver cmsis-dap(或 cmsis-dap v2)和 transport swd。",
+            "中文克隆 CMSIS-DAP 的 VID/PID 五花八门, 认型号别只看名字, 要看 USB 描述符。",
+            "SWO 是否能用取决于 DAPLink 固件版本, 不确定就先按没有 SWO 规划(用 RTT 或串口)。",
+        ],
+        "degrade": "DAPLink 只适合当烧录/断点通道; 要 RTT 就上 OpenOCD rtt, 要选项字节/救砖就换 ST-Link。",
+        "tools": [
+            ("openocd", "OpenOCD(烧录 + gdb + RTT)", find_openocd, "装 OpenOCD, 或设 OPENOCD"),
+            ("pyocd", "pyOCD(可选: 列探针/烧录更省事)", find_pyocd, "pip install pyocd"),
+        ],
+    },
+}
+
+CONFIG_NAME = ".stm32-dev.json"
+
+
+def _norm_probe(name):
+    """探针名归一化: J-Link / stlinkv3 / cmsis-dap -> jlink/stlink/daplink; 认不出返回 ''。"""
+    n = (name or "").strip().lower().replace("_", "-").replace(" ", "")
+    if not n:
+        return ""
+    for pid, aliases in PROBE_ALIASES:
+        if n == pid:
+            return pid
+    for pid, aliases in PROBE_ALIASES:
+        for a in aliases:
+            if a and (n == a or a in n):
+                return pid
+    return ""
+
+
+def config_file(root=None):
+    return os.path.join(root or os.getcwd(), CONFIG_NAME)
+
+
+def load_config(root=None):
+    """读工程根配置; 读不到就给空 dict(不是错误)。"""
+    path = config_file(root)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg, root=None):
+    path = config_file(root)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+    except Exception as e:
+        raise SkillError("写配置失败 %s: %s" % (path, e))
+    return path
+
+
+def _argv_for(tool, *extra):
+    """Windows 上 .cmd/.bat 不能直接 CreateProcess, 要用 cmd /c 起(openocd.cmd 就是这种)。"""
+    if os.name == "nt" and tool.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", tool] + list(extra)
+    return [tool] + list(extra)
+
+
+def _run_quiet(argv, timeout=20):
+    """跑一个命令拿 stdout; 任何失败都返回空串(探测/体检不许把技能搞崩)。"""
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout)
+        return p.stdout.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def detect_jlink(verbose=False):
+    """用 JLink.exe 的 ShowEmuList 列 J-Link(顺带拿型号, 用来分辨 V9/V11)。"""
+    exe = find_jlink_cmd()
+    if not exe:
+        if verbose:
+            print("    [jlink] 没找到 JLink.exe(装 SEGGER 驱动, 或设 JLINK_CMD)")
+        return []
+    scr = os.path.join(tempfile.gettempdir(), "stm32-dev-showemu.jlink")
+    try:
+        with open(scr, "w", encoding="ascii", errors="replace") as fh:
+            fh.write("ShowEmuList\nexit\n")
+    except Exception:
+        return []
+    out = _run_quiet(_argv_for(exe, "-CommanderScript", scr), timeout=25)
+    found = []
+    for m in re.finditer(r"Serial number:\s*(\d+)(?:,\s*ProductName:\s*([^\r\n]+))?", out):
+        found.append({"probe": "jlink", "serial": m.group(1),
+                      "model": (m.group(2) or "").strip(), "raw": out})
+    if not found and verbose:
+        print("    [jlink] JLink.exe 在, 但没列出探针(没插好 / 被别的进程占用)")
+    return found
+
+
+def detect_stlink(verbose=False):
+    """用 STM32_Programmer_CLI -l 列 ST-Link(官方工具只在真 ST-Link 上才认)。"""
+    cli = find_stm32_cli()
+    if not cli:
+        if verbose:
+            print("    [stlink] 没找到 STM32_Programmer_CLI(装 STM32CubeCLT/CubeProgrammer, 或设 STM32_PROGRAMMER_CLI)")
+        return []
+    out = _run_quiet(_argv_for(cli, "-l"), timeout=30)
+    blocks = re.split(r"(?=ST-Link Probe \d+:)", out)
+    found = []
+    for b in blocks:
+        if "ST-Link Probe" not in b:
+            continue
+        sn = re.search(r"ST-LINK SN\s*:\s*(\S+)", b)
+        fw = re.search(r"ST-LINK FW\s*:\s*(\S+)", b)
+        bd = re.search(r"Board\s*:\s*([^\r\n]+)", b)
+        found.append({"probe": "stlink", "serial": sn.group(1) if sn else "",
+                      "model": ((fw.group(1) if fw else "") + " " + (bd.group(1).strip() if bd else "")).strip(),
+                      "raw": b})
+    if not found and verbose:
+        m = re.search(r"Error[^\r\n]*", out)
+        print("    [stlink] 官方 CLI 没认出 ST-Link" + ("(" + m.group(0).strip() + ")" if m else "(可能没插 / 克隆件)"))
+    return found
+
+
+_PNP_VIDS = {
+    "1366": ("jlink", "SEGGER J-Link"),
+    "0483": ("stlink", "ST-Link / STM32(VID 0483, 也可能是 VCP)"),
+    "0D28": ("daplink", "DAPLink / mbed (VID 0D28)"),
+    "1209": ("daplink", "DAPLink / Picoprobe (VID 1209)"),
+    "2E8A": ("daplink", "Raspberry Pi Pico (VID 2E8A)"),
+    "C251": ("daplink", "DAPLink (VID C251)"),
+}
+
+
+def _pnp_probes(verbose=False):
+    """Windows 兜底: 官方工具都认不出来时, 按 USB VID 看插了什么。"""
+    if os.name != "nt":
+        return []
+    ps = ("Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
+          "Where-Object { $_.InstanceId -match 'VID_(1366|0483|0D28|1209|2E8A|C251)' } | "
+          "ForEach-Object { $_.InstanceId }")
+    out = _run_quiet(["powershell", "-NoProfile", "-Command", ps], timeout=25)
+    saw = {}
+    for line in out.splitlines():
+        m = re.search(r"VID_([0-9A-Fa-f]{4})", line)
+        if not m:
+            continue
+        pid, label = _PNP_VIDS.get(m.group(1).upper(), ("", ""))
+        if pid:
+            saw[pid] = label
+    return [{"probe": p, "serial": "", "model": saw[p], "raw": ""} for p in sorted(saw)]
+
+
+def detect_daplink(verbose=False):
+    """pyocd 优先(能拿序列号); 没装 pyocd 就靠 USB VID 兜底认插没插。"""
+    exe = find_pyocd()
+    if exe:
+        out = _run_quiet(_argv_for(exe, "list", "--probes"), timeout=25)
+        if out.strip():
+            return [{"probe": "daplink", "serial": "", "model": "", "raw": out}]
+        if verbose:
+            print("    [daplink] pyocd 在, 但没列出探针")
+    elif verbose:
+        print("    [daplink] 没装 pyocd(只能看 USB 有没有插, 认不出型号): pip install pyocd")
+    return []
+
+
+def detect_probes(only="", verbose=False):
+    out = {}
+    ids = [only] if only else ["jlink", "stlink", "daplink"]
+    if "jlink" in ids:
+        out["jlink"] = detect_jlink(verbose)
+    if "stlink" in ids:
+        out["stlink"] = detect_stlink(verbose)
+    if "daplink" in ids:
+        out["daplink"] = detect_daplink(verbose)
+    return out
+
+
+def resolve_probe(args=None, cfg=None, verbose=False):
+    """定这次用哪个探针。返回 (probe_id, serial, 依据文字)。"""
+    explicit = getattr(args, "probe", None) if args else None
+    if explicit:
+        pid = _norm_probe(explicit)
+        if not pid:
+            raise SkillError("认不出这个探针: %s(可用: jlink / stlink / daplink)" % explicit)
+        serial = (getattr(args, "serial", "") or "").strip()
+        if serial == DEFAULT_SERIAL:
+            serial = ""
+        return pid, serial, "--probe"
+    env = os.environ.get("STM32_DEV_PROBE", "")
+    if env:
+        pid = _norm_probe(env)
+        if pid:
+            return pid, "", "环境变量 STM32_DEV_PROBE"
+    cfg = cfg if cfg is not None else load_config()
+    if cfg.get("probe"):
+        pid = _norm_probe(cfg["probe"])
+        if pid:
+            return pid, cfg.get("serial", "") or "", CONFIG_NAME
+    found = detect_probes(verbose=verbose)
+    hit = [k for k in ("jlink", "stlink", "daplink") if found.get(k)]
+    if len(hit) == 1:
+        sn = found[hit[0]][0]["serial"] if found[hit[0]] else ""
+        return hit[0], sn, "自动探测"
+    if not hit:
+        raise SkillError("没探测到任何调试器。插好 USB 后跑: stm32-dev.py probe detect --verbose")
+    raise SkillError("同时探测到多个调试器(%s)。请指定: --probe <名字>, 或 probe use <名字>" % "/".join(hit))
+
+
+def _probe_tool_status(pid):
+    """这个探针要用的本机工具在不在。返回 [(label, 路径 或 None, 装法)]。"""
+    out = []
+    for _key, label, finder, hint in PROBE_DEFS[pid]["tools"]:
+        try:
+            path = finder()
+        except Exception:
+            path = None
+        out.append((label, path, hint))
+    return out
+
+
+def _describe_effective(pid, serial, why):
+    d = PROBE_DEFS[pid]
+    jset(probe=pid, probe_name=d["name"], serial=serial, probe_source=why)
+    print("调试器: %s(%s)" % (d["name"], pid))
+    if serial:
+        print("  序列号: %s" % serial)
+    print("  来源: %s" % why)
+    return d
+
+
+def probe_for_work(verbose=False):
+    """这条命令该用哪个探针: 已定(参数/环境变量/工程配置)的直接用, 没定就快速探测一次。
+    探测顺序 jlink -> stlink -> daplink, 找到第一个就停; 全无返回 ''(交给旧路径报错)。"""
+    global _PROBE, _SERIAL
+    if _PROBE:
+        return _PROBE
+    for pid in ("jlink", "stlink", "daplink"):
+        hits = (detect_probes(only=pid) or {}).get(pid) or []
+        if hits:
+            _PROBE = pid
+            if not _SERIAL and hits[0].get("serial"):
+                _SERIAL = hits[0]["serial"]
+            if verbose:
+                print("自动选中调试器: %s(%s)" % (PROBE_DEFS[pid]["name"], pid))
+            return pid
+    return ""
+
+
+def _tool_line(label, path, hint):
+    if path:
+        print("  [有] %s" % label)
+        print("       %s" % path)
+    else:
+        print("  [缺] %s" % label)
+        print("       装法: %s" % hint)
+    return bool(path)
+
+
+def _find_dirs(patterns):
+    out = []
+    for pat in patterns:
+        p = os.path.expanduser(pat)
+        if any(c in p for c in "*?["):
+            out.extend(glob.glob(p))
+        elif os.path.isdir(p):
+            out.append(p)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 空项目脚手架(new): 生成一个能直接 make / 烧录 / 调试的最小工程
+# ---------------------------------------------------------------------------
+_FLASH_CODE = {"6": "32K", "8": "64K", "B": "128K", "Z": "192K", "C": "256K",
+               "D": "384K", "E": "512K", "F": "768K", "G": "1024K", "H": "1536K",
+               "I": "2048K"}
+
+
+def _stem_define(stem):
+    """CMSIS 的器件宏大小写是固定的: stm32g431xx -> STM32G431xx, stm32f103x8 -> STM32F103x8。
+
+    写错(全大写)的后果: stm32g4xx.h 认不出器件, RCC_* 这些寄存器位定义全没有 -> 编译报 undeclared。
+    """
+    return stem[:-2].upper() + stem[-2:]
+
+
+def _dev_key(device):
+    """订货号 -> CMSIS 家族键(前 9 位): STM32G431CBT6 -> STM32G431。"""
+    return (device or "").upper()[:9]
+
+
+def _cube_roots():
+    return [os.environ.get("STM32_CUBE_REPO", ""),
+            os.path.join(os.path.expanduser("~"), "STM32Cube", "Repository"),
+            "C:/ST/STM32Cube/Repository"]
+
+
+def find_cube_pack(device, verbose=False):
+    """找本地 STM32Cube 固件包(里面才有 CMSIS 头文件 + ST 官方启动文件/链接脚本)。"""
+    m = re.match(r"STM32([A-Z]{1,2})(\d)", (device or "").upper())
+    if not m:
+        return None
+    letters = m.group(1)
+    fam = letters if len(letters) == 2 else letters + m.group(2)
+    best, best_path = "", ""
+    for root in _cube_roots():
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            if name.upper().startswith("STM32CUBE_FW_%s_" % fam.upper()):
+                p = os.path.join(root, name)
+                if os.path.isdir(p) and name > best:
+                    best, best_path = name, p
+    if verbose and best_path:
+        print("    [cube] %s" % best_path)
+    return best_path or None
+
+
+def _cube_layout(pack):
+    """从 Cube 包定位: 设备头目录 / CMSIS 内核头目录 / 启动文件目录 / system_*.c。"""
+    dev_root = os.path.join(pack, "Drivers", "CMSIS", "Device", "ST")
+    core_inc = os.path.join(pack, "Drivers", "CMSIS", "Include")
+    if not os.path.isdir(dev_root) or not os.path.isdir(core_inc):
+        return None
+    for d in sorted(os.listdir(dev_root)):
+        inc = os.path.join(dev_root, d, "Include")
+        tpl = os.path.join(dev_root, d, "Source", "Templates")
+        gcc = os.path.join(tpl, "gcc")
+        if not (os.path.isdir(inc) and os.path.isdir(gcc)):
+            continue
+        try:
+            sysc = [x for x in sorted(os.listdir(tpl)) if x.startswith("system_") and x.endswith(".c")]
+        except OSError:
+            sysc = []
+        if not sysc:
+            continue
+        return {"dev_inc": inc, "core_inc": core_inc, "gcc": gcc,
+                "system": os.path.join(tpl, sysc[0])}
+    return None
+
+
+def _pick_startup(gcc_dir, device):
+    """选 ST 官方启动文件: 优先 <家族>xx.s, 否则按容量码选(STM32F103C8 -> startup_stm32f103x8.s)。"""
+    key = _dev_key(device).lower()
+    cands = sorted(glob.glob(os.path.join(gcc_dir, "startup_%s*.s" % key)))
+    if not cands:
+        cands = sorted(glob.glob(os.path.join(gcc_dir, "startup_%s*.s" % key[:8])))
+    if not cands:
+        return None, []
+    names = [os.path.basename(c) for c in cands]
+
+    def stem_of(p):
+        b = os.path.basename(p)
+        return b[len("startup_"):-2]
+
+    exact = [c for c in cands if os.path.basename(c).lower() == "startup_%sxx.s" % key]
+    if exact:
+        return exact[0], stem_of(exact[0])
+    if len(cands) == 1:
+        return cands[0], stem_of(cands[0])
+    code = (device or "").upper()[-1].lower()
+    pick = [c for c in cands if os.path.basename(c).lower().startswith("startup_%sx%s.s" % (key[:8], code))]
+    if len(pick) == 1:
+        return pick[0], stem_of(pick[0])
+    return None, names
+
+
+_CORE_TABLE = {
+    "core_cm0.h": ("-mcpu=cortex-m0", "", ""),
+    "core_cm0plus.h": ("-mcpu=cortex-m0plus", "", ""),
+    "core_cm3.h": ("-mcpu=cortex-m3", "", ""),
+    "core_cm4.h": ("-mcpu=cortex-m4", "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard"),
+    "core_cm7.h": ("-mcpu=cortex-m7", "-mfpu=fpv5-d16", "-mfloat-abi=hard"),
+    "core_cm23.h": ("-mcpu=cortex-m23", "", ""),
+    "core_cm33.h": ("-mcpu=cortex-m33", "-mfpu=fpv5-sp-d16", "-mfloat-abi=hard"),
+    "core_cm35p.h": ("-mcpu=cortex-m35p", "-mfpu=fpv5-sp-d16", "-mfloat-abi=hard"),
+    "core_cm55.h": ("-mcpu=cortex-m55", "-mfpu=fpv5-d16", "-mfloat-abi=hard"),
+}
+
+
+def _core_flags(dev_inc, stem):
+    """从 CMSIS 设备头读出内核与有没有 FPU -> gcc 的 -mcpu/-mfpu(不靠猜)。"""
+    core, fpu = "core_cm4.h", 1
+    try:
+        with open(os.path.join(dev_inc, stem + ".h"), errors="replace") as fh:
+            txt = fh.read()
+        m = re.search(r'#include\s+"(core_cm[0-9a-z]+)\.h"', txt)
+        if m:
+            core = m.group(1) + ".h"
+        if not re.search(r"#define\s+__FPU_PRESENT\s+1", txt):
+            fpu = 0
+    except OSError:
+        pass
+    cpu, mfpu, abi = _CORE_TABLE.get(core, ("-mcpu=cortex-m4", "", ""))
+    if not fpu:
+        mfpu, abi = "", ""
+    return cpu, mfpu, abi, core
+
+
+def _mem_from_cube(pack, device):
+    """直接抄 ST 自己示例工程的链接脚本内存参数 —— 比查表可靠。"""
+    key = _dev_key(device).upper()
+    hits = []
+    proj = os.path.join(pack, "Projects")
+    if os.path.isdir(proj):
+        for root, dirs, files in os.walk(proj):
+            for fn in files:
+                u = fn.upper()
+                if u.startswith(key) and u.endswith("_FLASH.LD"):
+                    hits.append(os.path.join(root, fn))
+            if len(hits) >= 5:
+                break
+    for p in hits:
+        try:
+            with open(p, errors="replace") as fh:
+                txt = fh.read()
+        except OSError:
+            continue
+        fl = re.search(r"FLASH\s*\([^)]*\)\s*:\s*ORIGIN\s*=\s*[^,]+,\s*LENGTH\s*=\s*([0-9]+[KMG]?)", txt, re.I)
+        rm = re.search(r"RAM\s*\([^)]*\)\s*:\s*ORIGIN\s*=\s*[^,]+,\s*LENGTH\s*=\s*([0-9]+[KMG]?)", txt, re.I)
+        if fl and rm:
+            return fl.group(1).upper(), rm.group(1).upper(), p
+    return None, None, ""
+
+
+def _flash_from_code(device):
+    """按 ST 的容量编码推 Flash 大小: STM32G431CB(T6) -> 第 11 位 B -> 128K。
+
+    订货号结构: STM32 | G431 | C(封装) | B(容量) | T(温度) | 6(其它)
+    所以容量码固定在第 11 位(索引 10); 只给 10 位型号时就是最后一位('8' 这种也认得)。
+    """
+    d = (device or "").upper().replace(" ", "")
+    code = d[10] if len(d) >= 11 else (d[-1] if d else "")
+    return _FLASH_CODE.get(code)
+
+
+def _make_exe():
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        for n in ("make.exe", "mingw32-make.exe", "make"):
+            p = os.path.join(d, n)
+            if d and os.path.isfile(p):
+                return p
+    for pat in ("C:/ST/STM32CubeCLT_*/Make/bin/make.exe",
+                "C:/ST/STM32CubeCLT_*/Make/bin/mingw32-make.exe"):
+        hits = sorted(glob.glob(pat))
+        if hits:
+            return hits[-1]
+    return "make"
+
+
+def _gcc_prefix():
+    """arm-none-eabi- 的前缀: PATH 里有就用命令名, 否则用 CubeCLT 自带的绝对路径。"""
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d and os.path.isfile(os.path.join(d, "arm-none-eabi-gcc.exe")):
+            return "arm-none-eabi-"
+    hits = sorted(glob.glob("C:/ST/STM32CubeCLT_*/GNU-tools-for-STM32/bin/arm-none-eabi-gcc.exe"))
+    if hits:
+        return hits[-1][:-len("gcc.exe")]
+    return "arm-none-eabi-"
+
+
+_MAKEFILE_TPL = """# @@TARGET@@ -- 由 stm32-dev 技能生成的最小可烧录工程(裸机 + CMSIS, 不依赖 HAL)
+# 芯片: @@DEVICE@@   调试器配置: .stm32-dev.json(改调试器: stm32-dev.py probe use)
+# 内核参数: @@CPU@@ @@FPU@@ @@ABI@@  (按 CMSIS 设备头自动判定; 单精度核如 F722 把 fpv5-d16 改成 fpv5-sp-d16)
+
+TARGET   := @@TARGET@@
+DEVICE   := @@DEVICE@@
+DEFS     := -D@@STEM_UPPER@@
+CUBE     := @@CUBE@@
+CUBE_INC := @@CUBE_INC@@
+CORE_INC := @@CORE_INC@@
+STARTUP  := @@STARTUP@@
+SYS_SRC  := @@SYS_SRC@@
+RUN      := @@RUN@@
+
+BUILD    := build
+PREFIX   := @@PREFIX@@
+CC       := $(PREFIX)gcc
+AS       := $(PREFIX)gcc -x assembler-with-cpp
+OBJCOPY  := $(PREFIX)objcopy
+SIZE     := $(PREFIX)size
+
+COREFLAGS := @@CPU@@ @@FPU@@ @@ABI@@
+CFLAGS    := $(COREFLAGS) -O2 -g3 -Wall -ffunction-sections -fdata-sections $(DEFS) -I$(CUBE_INC) -I$(CORE_INC) -I.
+LDFLAGS   := $(COREFLAGS) -Tlinker.ld -Wl,-Map=$(BUILD)/$(TARGET).map,--cref -Wl,--gc-sections -specs=nano.specs -specs=nosys.specs
+
+OBJS := $(BUILD)/main.o $(BUILD)/@@SYS_OBJ@@ $(BUILD)/@@STARTUP_OBJ@@
+
+.PHONY: all clean flash verify reset size doctor probe
+all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).hex $(BUILD)/$(TARGET).bin
+
+$(BUILD):
+	-mkdir $(BUILD)
+
+$(BUILD)/main.o: main.c | $(BUILD)
+	$(CC) -c $(CFLAGS) $< -o $@
+
+$(BUILD)/@@SYS_OBJ@@: $(SYS_SRC) | $(BUILD)
+	$(CC) -c $(CFLAGS) $< -o $@
+
+$(BUILD)/@@STARTUP_OBJ@@: $(STARTUP) | $(BUILD)
+	$(AS) -c $(CFLAGS) $< -o $@
+
+$(BUILD)/$(TARGET).elf: $(OBJS)
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
+	$(SIZE) $@
+
+$(BUILD)/$(TARGET).hex: $(BUILD)/$(TARGET).elf
+	$(OBJCOPY) -O ihex $< $@
+
+$(BUILD)/$(TARGET).bin: $(BUILD)/$(TARGET).elf
+	$(OBJCOPY) -O binary -S $< $@
+
+flash: all
+	$(RUN) flash --elf $(BUILD)/$(TARGET).elf
+
+verify: all
+	$(RUN) verify --elf $(BUILD)/$(TARGET).elf
+
+reset:
+	$(RUN) reset
+
+size: all
+	$(SIZE) $(BUILD)/$(TARGET).elf
+
+probe:
+	$(RUN) probe show
+
+doctor:
+	$(RUN) doctor
+
+clean:
+	-rmdir /s /q $(BUILD)
+	-rm -rf $(BUILD)
+"""
+
+_LD_TPL = """/* @@TARGET@@ -- 由 stm32-dev 技能生成
+ * 内存参数: FLASH=@@FLASH@@ RAM=@@RAM@@ (@@MEM_SRC@@)
+ * 必须对照芯片数据手册确认这两项 —— 填错会烧不进/跑飞。
+ */
+ENTRY(Reset_Handler)
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+_Min_Heap_Size = 0x200;
+_Min_Stack_Size = 0x400;
+
+MEMORY
+{
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = @@FLASH@@
+  RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = @@RAM@@
+}
+
+SECTIONS
+{
+  .isr_vector :
+  {
+    . = ALIGN(4);
+    KEEP(*(.isr_vector))
+    . = ALIGN(4);
+  } >FLASH
+
+  .text :
+  {
+    . = ALIGN(4);
+    *(.text) *(.text*)
+    *(.glue_7) *(.glue_7t) *(.eh_frame)
+    KEEP (*(.init)) KEEP (*(.fini))
+    . = ALIGN(4);
+    _etext = .;
+  } >FLASH
+
+  .rodata :
+  {
+    . = ALIGN(4);
+    *(.rodata) *(.rodata*)
+    . = ALIGN(4);
+  } >FLASH
+
+  .ARM.extab : { *(.ARM.extab* .gnu.linkonce.armextab.*) } >FLASH
+  .ARM : {
+    __exidx_start = .;
+    *(.ARM.exidx*)
+    __exidx_end = .;
+  } >FLASH
+
+  .preinit_array :
+  {
+    PROVIDE_HIDDEN (__preinit_array_start = .);
+    KEEP (*(.preinit_array*))
+    PROVIDE_HIDDEN (__preinit_array_end = .);
+  } >FLASH
+
+  .init_array :
+  {
+    PROVIDE_HIDDEN (__init_array_start = .);
+    KEEP (*(SORT(.init_array.*)))
+    KEEP (*(.init_array*))
+    PROVIDE_HIDDEN (__init_array_end = .);
+  } >FLASH
+
+  .fini_array :
+  {
+    PROVIDE_HIDDEN (__fini_array_start = .);
+    KEEP (*(SORT(.fini_array.*)))
+    KEEP (*(.fini_array*))
+    PROVIDE_HIDDEN (__fini_array_end = .);
+  } >FLASH
+
+  _sidata = LOADADDR(.data);
+
+  .data :
+  {
+    . = ALIGN(4);
+    _sdata = .;
+    *(.data) *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } >RAM AT> FLASH
+
+  . = ALIGN(4);
+  .bss :
+  {
+    _sbss = .;
+    __bss_start__ = _sbss;
+    *(.bss) *(.bss*) *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+    __bss_end__ = _ebss;
+  } >RAM
+
+  ._user_heap_stack :
+  {
+    . = ALIGN(8);
+    PROVIDE ( end = . );
+    PROVIDE ( _end = . );
+    . = . + _Min_Heap_Size;
+    . = . + _Min_Stack_Size;
+    . = ALIGN(8);
+  } >RAM
+
+  /* 黑匣子/故障转储放这里: 复位后还能读 (见技能的 blackbox 命令) */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _snoinit = .;
+    *(.noinit) *(.noinit*)
+    . = ALIGN(4);
+    _enoinit = .;
+  } >RAM
+
+  /DISCARD/ : { libc.a ( * ) libm.a ( * ) libgcc.a ( * ) }
+  .ARM.attributes 0 : { *(.ARM.attributes) }
+}
+"""
+
+_MAIN_TPL = """/* @@TARGET@@ -- 由 stm32-dev 技能生成的最小 main.c
+ *
+ * 这里只有内核级代码(任何 STM32 都能编过); 点灯/串口/CAN 等外设按你的板子自己加。
+ * 调试建议: 全局计数器就是最便宜的"探针", 读它就知道程序在不在跑:
+ *     stm32-dev.py read g_tick
+ */
+#include "@@DEV_HEADER@@"
+
+volatile uint32_t g_tick  = 0;              /* 每轮循环 +1 */
+volatile uint32_t g_magic = 0x5A5A0000u;
+
+int main(void)
+{
+    g_magic = 0x5A5A0001u;
+    while (1) {
+        g_tick++;
+        for (volatile uint32_t i = 0; i < 100000u; i++) { }   /* 粗延时 */
+    }
+}
+"""
+
+_README_TPL = """# @@TARGET@@
+
+由 stm32-dev 技能生成的最小工程(裸机 + CMSIS 官方启动文件, 不依赖 HAL)。
+
+- 编译: make
+- 烧录并校验: make flash
+- 复位运行: make reset
+- 看芯片/探针现状: make doctor
+- 换调试器: stm32-dev.py probe use <jlink|stlink|daplink>
+
+芯片: @@DEVICE@@; 调试器写在 .stm32-dev.json(技能每次命令都会自动读它)。
+内存参数: FLASH=@@FLASH@@ RAM=@@RAM@@ (@@MEM_SRC@@) —— 请对照数据手册确认。
+编译用的是本地 Cube 包: @@CUBE@@
+"""
+
+_RUNCMD_TPL = """@echo off
+rem 由 stm32-dev 技能生成: 让 Makefile 能直接调技能(路径含空格也用引号包好了)
+"@@PYTHON@@" "@@SKILL@@" %*
+"""
+
+_RUNSH_TPL = """#!/bin/sh
+# 由 stm32-dev 技能生成
+exec "@@PYTHON@@" "@@SKILL@@" "$@"
+"""
+
+
+def cmd_new(args):
+    """空项目脚手架: 生成能直接 make / 烧录 / 调试的最小工程。
+
+    芯片必须给对(--device); 调试器自动探测, 写进工程配置后以后不用再管。
+    """
+    root = os.path.abspath(args.dir or ".")
+    name = args.name or re.sub(r"[^0-9A-Za-z_]", "_", os.path.basename(root) or "firmware")
+    device = resolve_device(args, None)
+    print("=== 生成工程: %s (芯片 %s) ===" % (root, device))
+    pack = find_cube_pack(device, args.verbose)
+    if not pack:
+        key5 = _dev_key(device)[5:]
+        print("ERROR: 没找到本地 STM32Cube 固件包(CMSIS 头文件 + ST 官方启动文件都在里面)。")
+        print("  装法: STM32CubeMX -> Help -> Manage embedded software packages -> 勾选 STM32Cube MCU Package for %s" % key5)
+        print("        或手动下载 STM32Cube_FW_%s 解压到 %s" % (key5, os.path.join(os.path.expanduser("~"), "STM32Cube", "Repository")))
+        print("  也可以设环境变量 STM32_CUBE_REPO 指向包所在的上级目录。")
+        return 1
+    print("  Cube 包: %s" % pack)
+    layout = _cube_layout(pack)
+    if not layout:
+        print("ERROR: 这个 Cube 包里没有 CMSIS 设备文件: %s" % pack)
+        return 1
+    startup, stem = _pick_startup(layout["gcc"], device)
+    if not startup:
+        print("ERROR: 找不到 %s 对应的启动文件。候选: %s" % (device, ", ".join(stem)))
+        print("  -> 用 --device 给准确型号(例 --device STM32G431CB)")
+        return 1
+    cpu, mfpu, abi, core = _core_flags(layout["dev_inc"], stem)
+    print("  启动文件: %s   内核: %s (%s %s %s)" % (os.path.basename(startup), core, cpu, mfpu, abi))
+    mem_src = "内置容量表"
+    flash, ram = None, None
+    st_flash, st_ram, st_ld = _mem_from_cube(pack, device)
+    if st_flash and st_ram:
+        guess = _flash_from_code(device)
+        if guess and guess != st_flash:
+            print("  [warn] ST 示例链接脚本写的是 %s, 型号编码指向 %s -> 按型号编码; 要用 ST 的值就显式给 --flash" % (st_flash, guess))
+        else:
+            flash, ram = st_flash, st_ram
+            mem_src = "抄自 ST 示例 %s" % os.path.basename(st_ld)
+    if not flash:
+        flash = _flash_from_code(device)
+    if args.flash:
+        flash = args.flash
+        mem_src = "--flash 指定"
+    if args.ram:
+        ram = args.ram
+        mem_src = "--ram 指定"
+    if not flash or not ram:
+        print("ERROR: 内存参数没定下来(Flash=%s RAM=%s)。" % (flash or "?", ram or "?"))
+        print("  -> 查数据手册后显式给: --flash 128K --ram 32K")
+        return 1
+    skill = os.path.abspath(__file__)
+    python = sys.executable or "python"
+    prefix = _gcc_prefix()
+    files = {}
+    files["Makefile"] = (_MAKEFILE_TPL
+                         .replace("@@TARGET@@", name).replace("@@DEVICE@@", device)
+                         .replace("@@STEM_UPPER@@", _stem_define(stem))
+                         .replace("@@CUBE@@", pack.replace("\\", "/"))
+                         .replace("@@CUBE_INC@@", layout["dev_inc"].replace("\\", "/"))
+                         .replace("@@CORE_INC@@", layout["core_inc"].replace("\\", "/"))
+                         .replace("@@STARTUP@@", startup.replace("\\", "/"))
+                         .replace("@@SYS_SRC@@", layout["system"].replace("\\", "/"))
+                         .replace("@@SYS_OBJ@@", os.path.basename(layout["system"])[:-2] + ".o")
+                         .replace("@@STARTUP_OBJ@@", os.path.basename(startup)[:-2] + ".o")
+                         .replace("@@PREFIX@@", prefix)
+                         .replace("@@RUN@@", "tools/stm32-dev-run" + (".cmd" if os.name == "nt" else ".sh"))
+                         .replace("@@CPU@@", cpu).replace("@@FPU@@", mfpu).replace("@@ABI@@", abi))
+    files["linker.ld"] = (_LD_TPL.replace("@@TARGET@@", name).replace("@@FLASH@@", flash)
+                          .replace("@@RAM@@", ram).replace("@@MEM_SRC@@", mem_src))
+    files["main.c"] = _MAIN_TPL.replace("@@TARGET@@", name).replace("@@DEV_HEADER@@", stem + ".h")
+    files["README.md"] = (_README_TPL.replace("@@TARGET@@", name).replace("@@DEVICE@@", device)
+                          .replace("@@FLASH@@", flash).replace("@@RAM@@", ram)
+                          .replace("@@MEM_SRC@@", mem_src).replace("@@CUBE@@", pack))
+    files[".gitignore"] = "build/\n"
+    tools_dir = os.path.join(root, "tools")
+    runner = "stm32-dev-run" + (".cmd" if os.name == "nt" else ".sh")
+    files[os.path.join("tools", runner)] = (
+        (_RUNCMD_TPL if os.name == "nt" else _RUNSH_TPL)
+        .replace("@@PYTHON@@", python).replace("@@SKILL@@", skill))
+    if not args.force:
+        clash = [fn for fn in files if os.path.isfile(os.path.join(root, fn))]
+        if clash:
+            print("ERROR: 这些文件已存在, 不覆盖: %s" % ", ".join(clash))
+            print("  -> 确认要重写就加 --force")
+            return 1
+    os.makedirs(tools_dir, exist_ok=True)
+    for fn, txt in files.items():
+        p = os.path.join(root, fn)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", newline="\n") as fh:
+            fh.write(txt)
+        print("  + %s" % fn)
+    kind = probe_for_work(verbose=False)
+    if kind:
+        cfg = load_config(root)
+        cfg["probe"] = kind
+        if _SERIAL and _SERIAL != DEFAULT_SERIAL:
+            cfg["serial"] = _SERIAL
+        save_config(cfg, root)
+        print("  + .stm32-dev.json (调试器: %s)" % kind)
+        print("    以后所有命令都会自动用这个调试器; 换: stm32-dev.py probe use <jlink|stlink|daplink>")
+    else:
+        print("  [提醒] 现在没探测到调试器 -> 插好后跑: stm32-dev.py probe use <jlink|stlink|daplink>")
+    if args.no_build:
+        print("跳过编译(--no-build)。下一步: cd %s && make" % root)
+        return 0
+    mk = _make_exe()
+    print("=== 编译验证: %s -j4 ===" % mk)
+    try:
+        r = subprocess.run([mk, "-j4"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    except Exception as e:
+        print("ERROR: 跑 make 失败: %s" % e)
+        return 1
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out[-1500:])
+    if r.returncode != 0:
+        print("!! 编译失败。生成的 Makefile 里内核/FPU/内存都是自动填的, 把上面这段发我或用 --flash/--ram 覆盖。")
+        return 1
+    elf = os.path.join(root, "build", name + ".elf")
+    print("OK: 工程生成 + 编译通过 -> %s" % elf)
+    print("下一步: cd %s && make flash" % root)
+    jset(project=root, device=device, elf=elf, probe=kind or None, flash=flash, ram=ram)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 串口观测(串口探针帧): 不占用调试器, 换任何探针都能用
+# ---------------------------------------------------------------------------
+_SERIAL_HINTS = (
+    (("stlink", "st-link", "stmicro"), 90, "ST-Link 自带的虚拟串口"),
+    (("ch340", "cp210", "ftdi", "silicon labs", "prolific", "wch", "usb-serial", "usb serial"), 80, "USB 转串口"),
+)
+_NOT_TARGET = ("bth", "bluetooth", "\u84dd\u7259", "acpi")
+
+
+def _serial_ports(verbose=False):
+    """列本机串口, 按"最可能是目标板"排序。没装 pyserial 返回 None。"""
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return None
+    out = []
+    for p in list_ports.comports():
+        desc = (p.description or "")
+        low = (desc + " " + (p.hwid or "")).lower()
+        score, why = 10, "未知设备"
+        if any(b in low for b in _NOT_TARGET):
+            score, why = -10, "蓝牙/主板自带, 一般不是目标板"
+        else:
+            for keys, sc, w in _SERIAL_HINTS:
+                if any(k in low for k in keys):
+                    score, why = sc, w
+                    break
+            else:
+                if "usb" in low:
+                    score, why = 70, "USB 串口设备"
+        out.append({"port": p.device, "desc": desc, "why": why, "score": score})
+    out.sort(key=lambda d: (-d["score"], d["port"]))
+    if verbose:
+        for d in out:
+            print("    [%s] %s  (%s)" % (d["port"], d["desc"], d["why"]))
+    return out
+
+
+def cmd_serial(args):
+    """读串口里固件自己吐的观测帧。
+
+    这条通道不碰调试器: 换 J-Link / ST-Link / DAPLink 都一样用,
+    而且可以和"调试/烧录"同时进行(调试器独占的是探针, 不是串口)。
+    """
+    import time
+    ports = _serial_ports(args.verbose)
+    if ports is None:
+        print("ERROR: 没装 pyserial(读串口的库)。")
+        print("  装法: %s -m pip install pyserial" % (sys.executable or "python"))
+        return 1
+    if args.list:
+        if not ports:
+            print("本机没看到任何串口。")
+            return 1
+        print("本机串口(按最可能是目标板排序):")
+        for d in ports:
+            print("  %-8s %s  <- %s" % (d["port"], d["desc"], d["why"]))
+        print("读串口: %s %s serial --port <串口> --seconds 5" % (sys.executable or "python", os.path.abspath(__file__)))
+        return 0
+    port = args.port or ""
+    if not port:
+        cands = [d for d in ports if d["score"] >= 70]
+        if len(cands) == 1:
+            port = cands[0]["port"]
+            print("自动选中串口 %s (%s)" % (port, cands[0]["desc"]))
+        elif not cands:
+            print("ERROR: 没找到像目标板的串口。本机看到:")
+            for d in ports:
+                print("  %s: %s" % (d["port"], d["desc"]))
+            print("  -> 显式指定: --port COM21")
+            return 1
+        else:
+            print("ERROR: 有多个串口候选, 请用 --port 指定:")
+            for d in cands:
+                print("  %s: %s (%s)" % (d["port"], d["desc"], d["why"]))
+            return 1
+    try:
+        import serial
+    except ImportError:
+        print("ERROR: 没装 pyserial。装法: %s -m pip install pyserial" % (sys.executable or "python"))
+        return 1
+    try:
+        ser = serial.Serial(port, args.baud, timeout=0.2)
+    except Exception as e:
+        print("ERROR: 打不开 %s: %s" % (port, e))
+        print("  -> 常见原因: ① 被别的程序占着(串口助手/上位机/另一个脚本)")
+        print("               ② 串口号不对(拔插一次会变) -> --list 看现在的")
+        print("               ③ 板子没插")
+        return 1
+    flags = 0 if args.case_sensitive else re.I
+    print("=== 读串口 %s @ %d baud, 最多 %s 秒 (Ctrl+C 可提前结束) ===" % (port, args.baud, args.seconds))
+    lines, buf, t0 = [], "", time.time()
+    try:
+        while time.time() - t0 < args.seconds:
+            chunk = ser.read(4096)
+            if not chunk:
+                continue
+            buf += chunk.decode("utf-8", errors="replace")
+            while True:
+                m = re.search(r"\r\n|\n|\r", buf)
+                if not m:
+                    break
+                line, buf = buf[:m.start()], buf[m.end():]
+                lines.append(line)
+                if not args.grep or re.search(args.grep, line, flags):
+                    print(line)
+    except KeyboardInterrupt:
+        print("(手动结束)")
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+    if buf.strip():
+        lines.append(buf)
+        if not args.grep or re.search(args.grep, buf, flags):
+            print(buf)
+    data = "\n".join(lines)
+    took = round(time.time() - t0, 1)
+    print("=== 结束: %d 行 / %s 秒 ===" % (len(lines), took))
+    if args.save:
+        try:
+            with open(args.save, "w", encoding="utf-8") as fh:
+                fh.write(data)
+            print("已存原文: %s" % args.save)
+        except OSError as e:
+            print("!! 存文件失败: %s" % e)
+    jset(port=port, baud=args.baud, lines=len(lines), seconds=took, saved=args.save or None)
+    if not lines:
+        print("!! 一行都没收到。按顺序查:")
+        print("   1) 波特率对不对(常见 115200; 问固件里怎么配的)")
+        print("   2) 板子到底有没有在发(固件里加一句开机就打印的问候语最省事)")
+        print("   3) 接线: TXD->RXD 交叉 + 必须共地")
+        print("   4) RS485 半双工要等方向控制切到发送, 或先只看能不能收到任何字节")
+        return 1
+    rc = 0
+    if args.grep:
+        hits = [l for l in lines if re.search(args.grep, l, flags)]
+        print("--grep %s: %d/%d 行命中" % (args.grep, len(hits), len(lines)))
+        if not hits:
+            rc = 1
+    if args.check_seq:
+        res = analyze_increasing_seq(data)
+        if res is None:
+            print("--check-seq: 没找到递增计数列。建议固件每帧带 seq=<自增数>, 这样丢帧可判定。")
+        else:
+            k, n, mx, gaps, lead, base = res
+            print("--check-seq: 字段 %s, %d 个样本, 正常步长 %d, 稳态最大跳变 %d, 超步长 %d 次 -> %s"
+                  % (k, n, base, mx, gaps, "无丢帧" if gaps == 0 else "有丢帧"))
+            jset(seq_check={"field": k, "samples": n, "base_delta": base,
+                            "max_delta": mx, "gaps": gaps, "ok": gaps == 0})
+            if lead > 1:
+                print("            开头追赶区最大跳变 %d (缓冲区旧内容->实时数据, 不计入丢帧)" % lead)
+            if gaps != 0:
+                print("!! 有丢帧: 串口这一侧丢帧多半是上位机读太慢/波特率不匹配, 不能直接判固件丢帧。")
+                rc = 1
+            else:
+                print("--check-seq 判定通过: 序号严格递增。")
+    return rc
+
+
+def _pip_install(pkg, verbose=False):
+    """装一个 Python 包(用户级, 不需要管理员)。返回 True/False。"""
+    argv = [sys.executable or "python", "-m", "pip", "install", "--disable-pip-version-check", pkg]
+    print("  [pip] %s" % " ".join(argv))
+    try:
+        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600,
+                           text=True, encoding="utf-8", errors="replace")
+    except Exception as e:
+        print("        失败: %s" % e)
+        print("        手动装: %s" % " ".join(argv))
+        return False
+    if r.returncode == 0:
+        print("        装好了: %s" % pkg)
+        return True
+    print("        没装上(可能是网络或权限)。手动装: %s" % " ".join(argv))
+    if verbose:
+        print(((r.stdout or ""))[-600:])
+    return False
+
+
+def _sys_install_cmds(what):
+    """该缺件在本机的系统级安装命令(已实测存在)。给不出可靠命令就返回 []。"""
+    win = (os.name == "nt")
+    if what == "openocd":
+        return (["winget", "install", "--accept-source-agreements", "--accept-package-agreements",
+                 "--id", "xpack-dev-tools.openocd-xpack"] if win
+                else ["sudo", "apt", "install", "-y", "openocd"])
+    if what == "gcc":
+        return (["winget", "install", "--accept-source-agreements", "--accept-package-agreements",
+                 "--id", "Arm.GnuArmEmbeddedToolchain"] if win
+                else ["sudo", "apt", "install", "-y",
+                      "gcc-arm-none-eabi", "gdb-multiarch", "make"])
+    if what == "make":
+        return (["winget", "install", "--accept-source-agreements", "--accept-package-agreements",
+                 "--id", "ezwinports.make"] if win
+                else ["sudo", "apt", "install", "-y", "make"])
+    return []
+
+
+def _auto_install(argv, label, verbose=False):
+    """跑一条系统级安装命令(只有用户显式 --install 时才调用)。"""
+    print("  [装] %s <- %s" % (label, " ".join(argv)))
+    try:
+        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800,
+                           text=True, encoding="utf-8", errors="replace")
+    except Exception as e:
+        print("        失败: %s" % e)
+        return False
+    if r.returncode == 0:
+        print("        装好了: %s" % label)
+        return True
+    print("        没成功(可能要管理员权限或网络不通)。手动跑: %s" % " ".join(argv))
+    if verbose:
+        print(((r.stdout or ""))[-600:])
+    return False
+
+
+def _proactive_lines(pid, cfg=None):
+    """按当前调试器列出「还能做什么」: 没用上的能力 + 现成命令。探针无关的三条永远给。"""
+    root = os.getcwd()
+    elfs = glob.glob(os.path.join(root, "build", "*.elf")) + glob.glob(os.path.join(root, "*.elf"))
+    elf = elfs[0] if elfs else "build/你的工程.elf"
+    common = [
+        "串口自报帧(不占调试器, 换任何探针都一样): serial --port COM<n> --seconds 5 --check-seq",
+        "跨复位黑匣子(.noinit 里留现场, 事后读一次): blackbox --elf %s" % elf,
+        "DWT 打点(计时/计数不占带宽): 读 DWT_CYCCNT -> read 0xE0001004(先看 0xE0001000 的 bit0); 固件侧见 OBSERVE.md, 探针无关",
+    ]
+    per = {
+        "jlink": [
+            "实时日志(RTT): rtt --elf %s --check-seq   (原生 MB/s 双向, 这是 J-Link 唯一不可替代的强项)" % elf,
+            "往板子回灌数据(下行通道, 别的探针基本做不了): rtt-send --channel 0 文本",
+            "选项字节/读保护: J-Link 侧没有现成 CLI, 得手写 Commander 脚本; 换 ST-Link 才有一行命令",
+        ],
+        "stlink": [
+            "选项字节/读保护/救砖(本技能原来没有的能力): STM32_Programmer_CLI -c port=SWD mode=UR -ob RDP=0xAA  (擦全片解保护, 会清空固件)",
+            "板上 HardFault 现场直读(不用自己写转储代码): STM32_Programmer_CLI -hf",
+            "V3/V2 自带虚拟串口: 一根 USB 同时给 SWD + 串口, 插上后 serial --list 会多一个 COM",
+            "SWD 时钟默认已用 8MHz(V3 上限); 线长或干扰大时在 -c 里加 freq=4000 降速",
+            "SWO/ITM 也能走 OpenOCD(swo create + tpiu create), 前提是板子把 SWO 引脚引出来了",
+            "实时日志走 OpenOCD rtt server: 能用, 但比 J-Link 慢 1~2 个数量级",
+        ],
+        "daplink": [
+            "免驱 CMSIS-DAP: 插上就能用, 不用装厂商驱动",
+            "装 pyOCD 会更省心(配置更少, 烧录/复位一条命令): python -m pip install pyocd",
+            "SWO/ITM: 只有 v2 版 DAPLink 带 SWO 端点, v1 没有",
+            "选项字节/救砖: 要走 OpenOCD 的 option 命令, 比 ST 官方 CLI 麻烦",
+            "实时日志走 OpenOCD rtt server(和 ST-Link 同一条路)",
+        ],
+    }
+    if pid in per:
+        return per[pid] + common
+    return ["还没定调试器: 先 probe detect(看插着哪个) 或 probe list(看支持哪些)"] + common
+
+
+def cmd_setup(args):
+    """一键体检: 调试器 + 工具链 + 芯片资料 + 工程, 每项缺什么就说怎么装。"""
+    verbose = bool(getattr(args, "verbose", False))
+    fix = bool(getattr(args, "fix", False))
+    install = bool(getattr(args, "install", False))
+    if install:
+        fix = True        # --install 隐含 --fix: 先自动补能补的, 再装系统件
+    cfg = load_config()
+    problems = []
+    need = []             # 缺的东西, 交给 --fix / --install 自动处理
+
+    print("=== 1/4 调试器(探针) ===")
+    pid, serial, why = "", "", ""
+    try:
+        pid, serial, why = resolve_probe(args, cfg, verbose)
+    except SkillError as e:
+        print("  还没定: %s" % e)
+    if pid:
+        _describe_effective(pid, serial, why)
+        for label, path, hint in _probe_tool_status(pid):
+            if not _tool_line(label, path, hint):
+                problems.append("%s 的 %s 没装" % (PROBE_DEFS[pid]["name"], label))
+        print("  最强用法: %s" % PROBE_DEFS[pid]["best"])
+        if fix and not cfg.get("probe"):
+            p = save_config({"probe": pid, **({"serial": serial} if serial else {})})
+            print("  已写进工程配置: %s(以后不用再指定)" % p)
+
+    print("")
+    print("=== 2/4 编译工具链 ===")
+    gd = find_gdb()
+    gcc_dirs = [os.path.dirname(gd)] if gd else []
+    gcc = _which_or_dirs(["arm-none-eabi-gcc", "arm-none-eabi-gcc.exe"], gcc_dirs, "ARM_GCC")
+    if not gcc:
+        gcc = _glob_first(["C:/ST/STM32CubeCLT_*/GNU-tools-for-STM32/bin/arm-none-eabi-gcc.exe",
+                           "/opt/st/stm32cubeclt_*/GNU-tools-for-STM32/bin/arm-none-eabi-gcc"])
+    _tool_line("arm-none-eabi-gcc(编译器)", gcc,
+               "装 STM32CubeCLT(自带编译器+gdb+make/cmake/ninja); Linux: apt install gcc-arm-none-eabi")
+    if not gcc:
+        problems.append("编译器 arm-none-eabi-gcc 没装")
+        need.append("gcc")
+    _tool_line("arm-none-eabi-gdb(调试器前端)", gd,
+               "装 STM32CubeCLT, 或把 gdb 路径写进环境变量 STM32_DEBUG_GDB")
+    if not gd:
+        problems.append("gdb 没装")
+    _tool_line("arm-none-eabi-objcopy(生成 hex/bin)", find_objcopy(),
+               "随编译器一起装(同 arm-none-eabi-gcc)")
+    make = _which_or_dirs(["make", "make.exe", "mingw32-make", "mingw32-make.exe"],
+                          _find_dirs(["C:/ST/STM32CubeCLT_*/GNU-tools-for-STM32/bin",
+                                      "C:/ST/STM32CubeCLT_*/Make/bin"]), "MAKE")
+    cmake = _which_or_dirs(["cmake", "cmake.exe"],
+                           _find_dirs(["C:/ST/STM32CubeCLT_*/CMake/bin"]), "CMAKE")
+    ninja = _which_or_dirs(["ninja", "ninja.exe"],
+                           _find_dirs(["C:/ST/STM32CubeCLT_*/Ninja/bin"]), "NINJA")
+    _tool_line("make(或 cmake+ninja 二选一)", make or cmake,
+               "随 STM32CubeCLT 装; 或 winget install ezwinports.make / Kitware.CMake")
+    if not (make or cmake):
+        problems.append("make/cmake 都没有(空工程脚手架生成的 Makefile 跑不起来)")
+        need.append("make")
+    if cmake and not ninja:
+        print("  [提示] cmake 有但 ninja 没装: 用 make 生成器即可, 或 winget install Ninja-build.Ninja")
+    try:
+        import serial as _serial_probe      # noqa: F401  只探测有没有装, 不真用
+        _pyserial_ok = True
+    except Exception:
+        _pyserial_ok = False
+    _tool_line("pyserial(读串口自报帧, 不占调试器)", "yes" if _pyserial_ok else "",
+               "装法: %s -m pip install pyserial   (setup --fix 会自动装)" % (sys.executable or "python"))
+    if not _pyserial_ok:
+        problems.append("pyserial 没装(serial 串口观测用不了)")
+        need.append("pyserial")
+    if pid == "daplink" and not find_pyocd():
+        print("  [提示] DAPLink 装上 pyOCD 会更省心(可选): %s -m pip install pyocd  (--fix 也会装)" % (sys.executable or "python"))
+        need.append("pyocd")
+
+    print("")
+    print("=== 3/4 芯片资料(SVD 寄存器解码 / OpenOCD 目标脚本) ===")
+    svd_dirs = _find_dirs(SVD_SEARCH_DIRS)
+    n_svd = 0
+    for d in svd_dirs:
+        try:
+            n_svd += len([x for x in os.listdir(d) if x.lower().endswith(".svd")])
+        except Exception:
+            pass
+    if svd_dirs:
+        print("  [有] 找到 %d 个 SVD(寄存器位域解码可用), 例: %s" % (n_svd, svd_dirs[0]))
+    else:
+        print("  [缺] 没有 SVD: 寄存器位域解码用不了")
+        print("       装法: 装 STM32CubeCLT/CubeMX(winget 里没有 CubeCLT 包, 只能从 ST 官网下安装器),")
+        print("             或把 .svd 放到工程里, 或设 STM32_SVD_DIR")
+    ocd = find_openocd()
+    if ocd:
+        base = os.path.dirname(os.path.abspath(ocd))
+        cands = [os.path.join(base, "openocd", "scripts"), os.path.join(base, os.pardir, "openocd", "scripts"),
+                 os.path.join(base, os.pardir, "share", "openocd", "scripts")]
+        hit = [c for c in cands if os.path.isdir(os.path.join(c, "target"))]
+        if hit:
+            print("  [有] OpenOCD 目标脚本: %s" % os.path.join(hit[0], "target"))
+        else:
+            # 找不到 scripts 目录时, 真跑一次"只加载配置、不碰探针"来判: 配置能加载就说明自带搜索路径够用
+            argv = _argv_for(ocd, "-f", "interface/stlink.cfg", "-f", "target/stm32g4x.cfg",
+                             "-c", "echo SCRIPT_OK; shutdown")
+            try:
+                p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=25)
+                txt = (p.stdout or b"").decode("utf-8", "replace")
+            except Exception:
+                txt = ""
+            if "SCRIPT_OK" in txt:
+                print("  [有] OpenOCD: %s(接口/目标配置文件能加载)" % ocd)
+            else:
+                print("  [有] OpenOCD: %s(接口/目标配置没加载成功, 可能需要 -s 指定 scripts 目录)" % ocd)
+    else:
+        print("  [缺] OpenOCD: 只在非 J-Link 探针(gdb server / RTT / SWO)时才需要")
+        print("       装法: winget install --id xpack-dev-tools.openocd-xpack, 或设 OPENOCD")
+        need.append("openocd")
+
+    print("")
+    print("=== 4/4 当前工程 ===")
+    root = os.getcwd()
+    for name, what in (("Makefile", "Make 工程"), ("CMakeLists.txt", "CMake 工程"),
+                       ("platformio.ini", "PlatformIO 工程"), (CONFIG_NAME, "本技能的探针配置")):
+        p = os.path.join(root, name)
+        if os.path.isfile(p):
+            print("  [有] %s (%s)" % (name, what))
+    elfs = glob.glob(os.path.join(root, "build", "*.elf")) + glob.glob(os.path.join(root, "*.elf"))
+    if elfs:
+        print("  [有] 固件: %s" % elfs[0])
+    else:
+        print("  [无] 没找到 .elf(还没编译过, 或输出目录不叫 build/)")
+
+    print("")
+    print("=== 主动建议: 你这个调试器还能做什么(不换探针也能上) ===")
+    for _ln in _proactive_lines(pid, cfg):
+        print("  - %s" % _ln)
+
+    if need and fix:
+        print("")
+        print("=== --fix 自动补(%d 项) ===" % len(need))
+        for w in need:
+            if w in ("pyserial", "pyocd"):
+                _pip_install(w, verbose)
+            elif install:
+                cmds = _sys_install_cmds(w)
+                if cmds:
+                    _auto_install(cmds, w, verbose)
+                else:
+                    print("  %s: 没有可靠的自动装法, 按上面的提示手动装" % w)
+            else:
+                cmds = _sys_install_cmds(w)
+                if cmds:
+                    print("  %s 要动系统, 没自动装。想让我装就加 --install -> %s" % (w, " ".join(cmds)))
+                else:
+                    print("  %s: 需要手动装(见上面的提示)" % w)
+
+    print("")
+    if problems:
+        print("结论: 还差 %d 项 -> %s" % (len(problems), "; ".join(problems)))
+        print("装完再跑一次 setup。只想现在就能烧录/调试的话, 上面标 [缺] 的最小集合先补上。")
+        return 1
+    print("结论: 齐了。下一步: make(或 cmake --build) -> flash -> 调试观察。")
+    return None
+
+
+def cmd_probe(args):
+    action = getattr(args, "action", "list") or "list"
+    raw_target = getattr(args, "target", "") or ""
+    target = _norm_probe(raw_target)
+    verbose = bool(getattr(args, "verbose", False))
+    if raw_target and not target:
+        raise SkillError("认不出这个探针: %s(可用: jlink / stlink / daplink)" % raw_target)
+    cfg = load_config()
+
+    if action == "list":
+        print("支持的调试器(探针) —— 命令层按能力选路, 不写死型号:")
+        for pid in ("jlink", "stlink", "daplink"):
+            d = PROBE_DEFS[pid]
+            print("")
+            print("  [%s] %s" % (pid, d["name"]))
+            print("    典型: %s" % ", ".join(d["matches"]))
+            print("    最强: %s" % d["best"])
+            miss = [lbl for lbl, p, _h in _probe_tool_status(pid) if not p]
+            if miss:
+                print("    本机缺工具: %s(它还能用, 但下面这些功能暂时没有)" % ", ".join(miss))
+            else:
+                print("    本机工具: 齐")
+        print("")
+        try:
+            pid, serial, why = resolve_probe(args, cfg, verbose)
+            _describe_effective(pid, serial, why)
+            print("  看单个探针细节: stm32-dev.py probe info %s" % pid)
+        except SkillError as e:
+            print("当前: 还没定(%s)" % e)
+            print("  第一步: stm32-dev.py probe detect  然后 probe use <名字>")
+        return None
+
+    if action == "detect":
+        # 探测过程的啰嗦输出先收起来: 汇总行先出, 过程放最后,
+        # 否则"某个探针没认出来"的中间提示会插在结果前面, 看着乱。
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            found = detect_probes(verbose=True)
+            _pnp_extra = _pnp_probes(verbose)
+        total = 0
+        for pid in ("jlink", "stlink", "daplink"):
+            hits = found.get(pid, [])
+            total += len(hits)
+            if hits:
+                for h in hits:
+                    extra = (" S/N=%s" % h["serial"]) if h.get("serial") else ""
+                    print("  [找到] %s: %s%s" % (pid, h.get("model") or PROBE_DEFS[pid]["name"], extra))
+            else:
+                print("  [没找到] %s" % PROBE_DEFS[pid]["name"])
+        for h in _pnp_extra:
+            print("  [USB 上看到] %s" % h["model"])
+        _detail = _buf.getvalue().strip()
+        if _detail:
+            print("")
+            print("  --- 探测过程 ---")
+            for _ln in _detail.splitlines():
+                print("  " + _ln)
+        if total == 0:
+            print("")
+            print("一个都没认出来。按顺序查:")
+            print("  1) USB 插好了吗, 换个口 / 换根线(只能充电的线不行)")
+            print("  2) 驱动装了吗: J-Link->SEGGER 驱动; ST-Link->STM32CubeCLT/CubeProgrammer; DAPLink->免驱")
+            print("  3) 别的程序是不是占着它(比如 IDE、另一个 gdb server、ST 的 stlinkserver)")
+            print("  4) 克隆 ST-Link 会被官方 CLI 拒(报 not a genuine ST device), 这种只能走 OpenOCD")
+            return 1
+        return None
+
+    if action == "use":
+        if not target:
+            raise SkillError("用法: probe use <jlink|stlink|daplink> [--serial <S/N>]")
+        found = detect_probes(only=target, verbose=verbose)
+        hits = found.get(target, [])
+        item = {"probe": target}
+        serial = (getattr(args, "serial", "") or "").strip()
+        if serial == DEFAULT_SERIAL:
+            serial = ""
+        if not serial and hits:
+            serial = hits[0].get("serial", "") or ""
+        if serial:
+            item["serial"] = serial
+        elif getattr(args, "persist", False):
+            raise SkillError("要写序列号进配置但没拿到: 先插好探针, 或 --serial <S/N>")
+        path = save_config(item)
+        _describe_effective(target, serial, "写进 " + os.path.basename(path))
+        print("  已写入: %s" % path)
+        if hits and hits[0].get("model"):
+            print("  认到的型号: %s" % hits[0]["model"])
+        print("  最好的用法: %s" % PROBE_DEFS[target]["best"])
+        miss = [lbl for lbl, p, _h in _probe_tool_status(target) if not p]
+        if miss:
+            print("  还缺工具(功能受限): %s -> 跑 setup 看怎么装" % ", ".join(miss))
+        return None
+
+    if action == "show":
+        try:
+            pid, serial, why = resolve_probe(args, cfg, verbose)
+        except SkillError as e:
+            print("当前没定调试器: %s" % e)
+            return 1
+        _describe_effective(pid, serial, why)
+        return None
+
+    # info
+    if not target:
+        raise SkillError("用法: probe info <jlink|stlink|daplink>")
+    d = PROBE_DEFS[target]
+    jset(probe=target, caps=d["caps"])
+    print("探针: %s(%s)" % (d["name"], target))
+    print("典型型号: %s" % ", ".join(d["matches"]))
+    print("最好的能力: %s" % d["best"])
+    print("")
+    print("能力对照(不同探针各有强弱, 技能按这个选路):")
+    for key, label in CAP_LABELS:
+        print("  %-18s %s" % (label, d["caps"].get(key, "")))
+    print("")
+    print("本机工具:")
+    for label, path, hint in _probe_tool_status(target):
+        if path:
+            print("  [有] %s -> %s" % (label, path))
+        else:
+            print("  [缺] %s -> %s" % (label, hint))
+    print("")
+    print("注意事项:")
+    for n in d["notes"]:
+        print("  - %s" % n)
+    print("")
+    print("没有它时怎么替代: %s" % d["degrade"])
+    return None
+
+
 def add_common(parser):
     parser.add_argument("--json", action="store_true", help="输出 JSON(供脚本/CI 调用)")
     parser.add_argument("--elf", default=None, help="ELF 路径(自动推断芯片)")
     parser.add_argument("--device", default=None, help="芯片型号 e.g. STM32H743VI")
-    parser.add_argument("--serial", default=DEFAULT_SERIAL, help="J-Link 序列号")
+    parser.add_argument("--serial", default=DEFAULT_SERIAL, help="探针序列号(多探针时必须给)")
+    parser.add_argument("--probe", default=None,
+                        help="调试器: jlink / stlink / daplink (不给则查 .stm32-dev.json 或自动探测)")
 
 
 def build_parser():
@@ -2271,17 +5133,61 @@ def build_parser():
     s = sub.add_parser("doctor"); add_common(s)
     s.set_defaults(func=cmd_doctor)
 
+    s = sub.add_parser("probe", help="调试器(探针)选型: list / detect / use / info / show")
+    s.add_argument("action", nargs="?", default="list",
+                   choices=["list", "detect", "use", "info", "show"],
+                   help="list=支持哪些(默认) detect=现在插着哪个 use=选定并写进工程配置 info=单个探针细节 show=当前生效")
+    s.add_argument("target", nargs="?", default="", help="use/info 时的探针名(jlink/stlink/daplink)")
+    s.add_argument("--persist", action="store_true", help="use 时把序列号也写进配置")
+    s.add_argument("--verbose", action="store_true", help="打印每条判定依据")
+    add_common(s)
+    s.set_defaults(func=cmd_probe)
+
+    s = sub.add_parser("setup", help="一键体检: 调试器 + 工具链 + 芯片资料 + 工程, 缺什么怎么装")
+    s.add_argument("--fix", action="store_true", help="能自动补的直接补(写探针配置 / pip 装 pyserial·pyocd)")
+    s.add_argument("--install", action="store_true", help="缺编译器/openocd 时自动跑 winget(或 apt) 装上(隐含 --fix)")
+    s.add_argument("--verbose", action="store_true", help="打印每条判定依据")
+    add_common(s)
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("new", help="空项目脚手架: 生成能直接 make/烧录/调试的最小工程")
+    add_common(s)
+    s.add_argument("--dir", default=".", help="工程目录(默认当前目录)")
+    s.add_argument("--name", default=None, help="工程名(默认=目录名)")
+    s.add_argument("--flash", default=None, help="Flash 大小(如 128K); 默认抄 ST 官方链接脚本")
+    s.add_argument("--ram", default=None, help="RAM 大小(如 32K); 拿不到时必须给")
+    s.add_argument("--force", action="store_true", help="覆盖已存在的文件")
+    s.add_argument("--no-build", action="store_true", dest="no_build", help="只生成, 不编译验证")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_new)
+
+    s = sub.add_parser("serial", help="读串口观测帧(不占用调试器, 换任何探针都一样用)")
+    add_common(s)
+    s.add_argument("--port", help="串口号, 例 COM21; 不给我自己挑(本机只有一个 USB 串口时)")
+    s.add_argument("--baud", type=int, default=115200, help="波特率(默认 115200)")
+    s.add_argument("--seconds", type=float, default=3.0, help="读多久(默认 3 秒)")
+    s.add_argument("--grep", help="只看匹配的行(正则); 一行都没命中则退出码 1")
+    s.add_argument("--case-sensitive", action="store_true", dest="case_sensitive", help="--grep 区分大小写")
+    s.add_argument("--check-seq", action="store_true", dest="check_seq", help="查固件自增序号有没有跳变(判丢帧)")
+    s.add_argument("--save", help="把读到的原文存成文件")
+    s.add_argument("--list", action="store_true", help="只列本机串口, 不读")
+    s.add_argument("--verbose", action="store_true", help="打印每个串口的判定依据")
+    s.set_defaults(func=cmd_serial)
     s = sub.add_parser("preflight", help="*开工第一步: 拿技能里的结论把现有工程扫一遍")
     add_common(s)
     s.add_argument("--root", default=None, help="工程根目录(默认当前目录)")
     s.set_defaults(func=cmd_preflight)
 
     s = sub.add_parser("read"); add_common(s); s.add_argument("targets", nargs="+")
-    s.add_argument("--keep-halted", action="store_true", help="读完后不恢复运行(默认会 monitor go)")
+    s.add_argument("--size", type=int, default=4, choices=[1, 2, 4, 8], help="读写裸地址时的宽度(字节, 1/2/4/8); 读符号时忽略。例: DWT CYCCNT 是 4")
+    s.add_argument("--keep-halted", action="store_true", help="读完后不恢复运行(默认会恢复)")
+    s.epilog = ("targets 可以是符号名(g_bb / uwTick), 也可以是裸地址(如 0xE000ED00 CPUID、"
+                "0xE0001004 DWT 的 CYCCNT); 没有 SVD 的外设与 Cortex-M 内核寄存器就用裸地址。")
     s.set_defaults(func=cmd_read)
 
     s = sub.add_parser("write"); add_common(s); s.add_argument("targets", nargs="+")
-    s.add_argument("--keep-halted", action="store_true", help="写完后不恢复运行(默认会 monitor go)")
+    s.add_argument("--size", type=int, default=4, choices=[1, 2, 4, 8], help="读写裸地址时的宽度(字节, 1/2/4/8); 读符号时忽略。例: DWT CYCCNT 是 4")
+    s.add_argument("--keep-halted", action="store_true", help="写完后不恢复运行(默认会恢复)")
     s.set_defaults(func=cmd_write)
 
     s = sub.add_parser("break"); add_common(s); s.add_argument("point", nargs="?", default=None)
@@ -2300,6 +5206,7 @@ def build_parser():
     s.set_defaults(func=cmd_verify)
 
     s = sub.add_parser("reset"); add_common(s)
+    s.add_argument("--dry-run", action="store_true", dest="dry_run", help="只打印将执行的复位命令")
     s.set_defaults(func=cmd_reset)
 
     s = sub.add_parser("selftest"); add_common(s)
@@ -2313,12 +5220,17 @@ def build_parser():
     s.add_argument("--timeout", type=float, default=1.0, help="每次等待回包秒数")
     s.add_argument("--repeat", type=int, default=1, help="重复次数(压测往返延迟)")
     s.add_argument("--interval", type=float, default=0.0, help="重复间隔 ms")
-    s.add_argument("--speed", type=int, default=4000)
+    s.add_argument("--speed", type=int, default=4000, help="J-Link 连接速度(kHz)")
+    s.add_argument("--channel", type=int, default=0, help="RTT 通道号(默认 0)")
+    s.add_argument("--rtt-port", type=int, default=9090,
+                   help="ST-Link/DAPLink 走 OpenOCD 时 RTT server 监听的本地 TCP 端口")
     s.set_defaults(func=cmd_rtt_send)
 
     s = sub.add_parser("init-rtt"); add_common(s)
     s.add_argument("--dir", default=None, help="工程目录(默认当前目录)")
     s.add_argument("--subdir", default=os.path.join("Middlewares", "SEGGER_RTT"), help="存放子目录")
+    s.add_argument("--offline", action="store_true",
+                   help="J-Link 安装目录里没有源码时, 也不要联网去官方仓库取")
     s.set_defaults(func=cmd_init_rtt)
 
     s = sub.add_parser("blackbox"); add_common(s)
@@ -2343,6 +5255,9 @@ def build_parser():
     s.set_defaults(func=cmd_svd)
 
     s = sub.add_parser("flash"); add_common(s); s.add_argument("--hex", default=None)
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="只打印将要执行的烧录命令, 不碰板子(第一次烧接电机的板子时先看这个)")
+    s.add_argument("--ur", action="store_true", help="ST-Link 专用: 用 mode=UR(under reset) 连接, 板子跑飞/被保护时用")
     s.add_argument("--no-verify", action="store_true", help="刷完不校验板子 Flash 与 ELF 是否一致")
     s.set_defaults(func=cmd_flash)
 
@@ -2358,6 +5273,8 @@ def build_parser():
                    help="自动分析抓包里的递增计数列, 报告丢帧")
     s.add_argument("--no-resume", action="store_true",
                    help="抓包前不自动恢复 CPU 运行(默认会 monitor go)")
+    s.add_argument("--rtt-port", type=int, default=9090,
+                   help="ST-Link/DAPLink 走 OpenOCD 时, RTT server 监听的本地 TCP 端口")
     s.set_defaults(func=cmd_rtt)
 
     s = sub.add_parser("build-verify"); add_common(s)
@@ -2372,7 +5289,7 @@ def build_parser():
 
 
 def main():
-    global _JSON, _SERIAL
+    global _JSON, _SERIAL, _PROBE, _DRY_RUN
     # Windows 控制台默认 GBK: 打印 -> / * / != 这类字符会直接 UnicodeEncodeError
     # 把整个命令弄崩(而命令本身其实是对的)。统一降级成 replace —— 宁可显示成
     # '?' 也不要命令失败。(坑 #8)
@@ -2383,7 +5300,12 @@ def main():
             pass
     args = build_parser().parse_args()
     _JSON = bool(getattr(args, "json", False))
-    _SERIAL = getattr(args, "serial", "") or DEFAULT_SERIAL
+    _DRY_RUN = bool(getattr(args, "dry_run", False))
+    _CFG = load_config()
+    _PROBE = _norm_probe(getattr(args, "probe", None) or os.environ.get("STM32_DEV_PROBE")
+                         or _CFG.get("probe", ""))
+    _SERIAL = (getattr(args, "serial", "") or _CFG.get("serial", "")
+               or DEFAULT_SERIAL)
     if _JSON:
         buf = io.StringIO()
         rc = 0
@@ -2395,6 +5317,8 @@ def main():
             except SkillError as e:
                 rc = 1
                 _JSON_DATA["error"] = str(e)
+            except _DryRun:
+                rc = None
             except Exception as e:
                 rc = 1
                 _JSON_DATA["error"] = "%s: %s" % (type(e).__name__, e)
@@ -2413,6 +5337,9 @@ def main():
     except SkillError as e:
         print("ERROR: %s" % e)
         sys.exit(1)
+    except _DryRun:
+        print("DRY-RUN: 到这儿停下, 板子没被动过。去掉 --dry-run 才真执行。")
+        sys.exit(0)
     except Exception as e:
         print("ERROR: %s: %s" % (type(e).__name__, e))
         sys.exit(1)

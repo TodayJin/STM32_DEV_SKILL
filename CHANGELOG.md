@@ -1,5 +1,47 @@
 # Changelog — stm32-dev 技能
 
+## 3.17.0 (2026-10-11) —— 调试器通用化：J-Link / ST-Link(V3) / DAPLink 插哪个用哪个
+
+**动机**：用户要求「技能最好能通用……要发挥不同调试器最好的能力……配好之后不需要人操控全自动来」。
+原技能把 SEGGER J-Link 焊死在每一层（环境变量、GDB server 选型、烧录脚本、RTT 抓包、cleanup 进程名单）。
+
+**新增命令（23 → 27 个）**
+- `probe list|detect|use|info|show`：三种调试器的能力矩阵与用法；自动探测插着哪个（J-Link `ShowEmuList` / `STM32_Programmer_CLI -l` / pyOCD + Windows PnP 兜底）；`probe use <id>` 把选择写进工程 `.stm32-dev.json`。
+- `setup [--fix]`：按当前调试器一键体检（工具链 / 芯片资料 / 工程状态），缺的告诉你怎么装，能自动补的直接补。
+- `serial`：串口观测（头号观测手段，**不占调试器**）—— `--list` 智能挑口（ST-Link 虚拟串口优先，蓝牙/主板扣分）、`--grep`、`--check-seq` 判丢帧、`--save`、`--json`。
+- `new`：空项目脚手架 —— 给目录 + 芯片，自动从 Cube 固件包抄 CMSIS 头、官方启动文件与内存参数，生成 Makefile + 链接脚本（含 `.noinit`）+ main.c 骨架 + `.stm32-dev.json`，可直接 `make`。
+
+**后端抽象**
+- ST-Link：烧录/复位/校验走 STM32_Programmer_CLI（`-w -v -rst`，读回校验 `-u` 逐字节比对），GDB 服务走 OpenOCD。
+- DAPLink：烧录/复位走 OpenOCD `program ... verify reset exit`，GDB 服务同 OpenOCD。
+- J-Link：原有路径全部保留（Commander 烧录 + 刷后逐字节校验 + `monitor go`）。
+- 解析优先级：`--probe` > 环境变量 `STM32_DEV_PROBE` > 工程 `.stm32-dev.json` > 自动探测。
+
+**RTT 也通用了（真机验证后追加）**
+- `rtt` 按调试器自动选通道：J-Link 仍走 `JLinkRTTLogger`；ST-Link / DAPLink 走 OpenOCD 的 `rtt setup` + `rtt start` + `rtt server start <port> <ch>`（本地 TCP，默认 9090，`--rtt-port` 可改），抓完按 PID + 新增进程双重清理（`cmd /c openocd.CMD` 会留下孤儿进程，只杀包装件等于没杀）。
+- **地址自愈**：ELF 符号地址抓空 → 自动改用 RAM 搜索（`0x20000000 0x20000`）再抓一次（文件名带 `-rescan`）。真机上正是这条救的场：板子跑的是旧固件（坑#9），符号地址无效，自动重抓成功抓到 94 行/8s。
+- 修中文 Windows 下的崩溃：subprocess 输出按 GBK 解码遇到非 GBK 字节会 `UnicodeDecodeError`，解码线程死后 `stdout=None` 再抛 `TypeError: unsupported operand type(s) for +: 'NoneType' and 'str'` → 17 处 `text=True` 全补 `encoding="utf-8", errors="replace"`，4 处 `stdout/stderr` 相参加固。
+- `svd` 认 SVD 的扁平寄存器名：`svd RCC.CFGR` 自动回退到 `RCC.RCC_CFGR`（ST 的 SVD 都是这种命名，以前必须写全名否则报错）。
+
+**文档**
+- 新增 `PROBES.md`（能力总览 / 最强用法 / 注意事项 / 换探针时每条命令走哪条路 / 报错速查）与 `SETUP.md`（按调试器看要装什么、装法与验证、环境变量、装完自检）。
+- SKILL.md：去掉「不用 openocd」的单探针前提；新增「第 0 步：选调试器与建工程」；③ 烧录章改成按调试器自动选路；④ 增「串口观测」一节；环境变量表、命令表、附录表同步。
+- **工具链自动配置（`setup --fix` / `setup --install`）**：`--fix` 自动把探测到的探针写进工程配置、缺 `pyserial` / `pyocd` 时用 `pip` 装上；`--install`（隐含 `--fix`）对缺的编译器 / openocd 直接跑系统包管理器。安装命令全部换成**实测存在**的包 ID：`xpack-dev-tools.openocd-xpack`、`Arm.GnuArmEmbeddedToolchain`、`Ninja-build.Ninja`；**CubeCLT 在 winget 里没有包**（实测搜不到），SETUP.md 已改成「去 ST 官网下安装器」。
+- **`setup` 新增「主动建议」段**：按当前调试器列出还没用上的能力和现成命令（ST-Link → 选项字节 / 救砖 / `-hf` / 虚拟串口；J-Link → RTT 双向 + 下行回灌；DAPLink → pyOCD / SWO 端点），另外永远给三条探针无关的（串口自报帧 / 黑匣子 / DWT）。配套在 SKILL.md 第 0 步立了行为规矩：**新工程开工前先问一句「就用这台吗」**，只有用户明确说没有某条件（如板子没引出 SWO）才降级。
+- 顺手修掉 SKILL.md 里 4 处写成字面量 `@@F@@` 的代码围栏（第 0 步与串口观测两处），以及 `@@F@@` 残留导致的代码块不闭合。
+- **`read` / `write` 支持裸地址**（新增 `--size 1/2/4/8`）：以前读内存要自己写 gdb 解引用表达式，现在 `read 0xE000ED00` 直接读。真机验证：CPUID=`0x410FC271`、DWT_CTRL=`0x40000001`、`--size 1` 读到 `0x41 'A'`。这一条把「没有 SVD 的东西」（DWT / ITM / SCB / TPIU）和 Cortex-M 内核寄存器变成可读可写，也是 SWO 那条路的先决条件。写裸地址只做了命令构造层面的断言（怕动板子没真写）。
+- **修掉一个换探针才会暴露的 bug**：`continue` 原来写死发 `monitor go`，OpenOCD（ST-Link/DAPLink）没有这条命令 —— 现在按探针发 `go` 或 `resume`（新函数 `_resume_cmd()`）。
+- **`rtt-send`（RTT 下行/回灌）也通用了**：原来只有 J-Link（还要 pylink-square），现在 ST-Link / DAPLink 走 OpenOCD 的 `rtt server` —— 它是**双向**的（源码 `src/server/rtt_server.c`：目标上行→socket，socket 写→`rtt_write_channel` 进目标下行缓冲）。离线验证：真起一个 openocd RTT server，连上、发送、收场无残留；`--expect` 没回包时正确返回 1。
+- **`init-rtt` 不再依赖 J-Link 安装目录**：安装包里没有 RTT 源码时自动从 SEGGER 官方仓库（BSD）取 6 个文件（`RTT/SEGGER_RTT.c/.h/_printf.c/_ASM_ARMv7M.S` + `RTT/SEGGER_RTT_ConfDefaults.h` + `Config/SEGGER_RTT_Conf.h`，路径按仓库实际布局），`--offline` 可关掉联网；汇编加速件也一起给，省得踩 `RTT_USE_ASM`。
+- **`--hex` 现在能吃 `70,0A`**（help 里一直这么写，但原来把逗号直接丢给 `bytes.fromhex` 会报错）。
+- **OpenOCD 抓包失败时不再只会说一句「没挂上端口」**：日志被强杀成空时会补一行「手动跑一遍看现场: <完整命令行>」；OpenOCD 的 `rtt` 命令**必须先加载 target 配置**才存在（这条也写进 PROBES.md 了，是之前误判「0.12 没有 rtt setup」的原因）。
+- `probe detect` 的输出顺序修顺：先出「找到/没找到」汇总，把探测过程的啰嗦提示统一收到末尾的「--- 探测过程 ---」里（原来会插在结果前面）。
+- **新增 `--dry-run`（`flash` / `reset`）**：只打印「将要执行的命令 + 这次给你选了哪条路」，板子一点都不碰。四条会动板子的路（J-Link 的 Commander 脚本、ST-Link 的 `-w … -rst`、OpenOCD 的 `program` 与 `reset run`）全部在执行前拦一次；拦的位置在写临时脚本之前，所以 dry-run 连临时文件都不留。第一次面对接了电机/电缸的板子先看这个。
+
+**验证**：`probe list` / `probe info stlink` / `probe detect`（无探针时给可执行的排查提示）/ `new` + `make`（临时目录里编出 elf/hex/bin）/ `serial --list` 与 `serial --port COM99`（错误路径）/ `flash` `verify` `reset` 的 argv 与失败提示逐条核对；`setup` / `setup --fix` 真机跑通（含第 5 段「主动建议」与 pip 自动补装）；`--dry-run` 用「把 `subprocess.run` 换成抛异常的桩」证明四条后端全部只打印、**零外部命令被执行**；脚本 `ast.parse` 通过；`selftest` 断言全 PASS（技能目录里 74 条；工程目录里有 ELF/SVD 时会多跑 3 条 = 77 条）。
+
+**真机复验（2026-10-04，J-Link PLUS S/N 602711133 + 项目板 STM32G431CBT6）**：`probe detect` 自动认出 J-Link；`doctor` 解析出 `_SEGGER_RTT=0x20000C48` / `g_bb=0x20000CF0`；`read` / `info` / `break` / `svd RCC.CFGR` / `blackbox` 全部跑通；`rtt --check-seq` 抓到 94 行/8s 并判定无丢帧；`verify` 报出板上固件与 `build/interface-adapter.elf` 有 40557 字节不同（坑#9 现场：板子跑的是旧固件，读变量会读到错位数据）。`selftest` 全 PASS。
+
 ## 3.16.0 (2026-10-06) —— `preflight`：把这个技能本身变成"开工第一步的检查清单"
 
 **动机**：用户要求「开始用的时候先对照技能检查好现有的工程」。这份技能攒了 89 条坑，但用的时候
