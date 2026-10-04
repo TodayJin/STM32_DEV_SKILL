@@ -327,7 +327,7 @@ make flash    # 若工程已配
 - **地址先解析、抓空会自愈**：先取 ELF 符号 `_SEGGER_RTT` 的地址（最快最准）；**一条数据都没抓到**就自动改用 RAM 搜索（`0x20000000 0x20000`）再抓一次 —— 这通常意味着**板子跑的不是这份 ELF**（坑#9，符号地址属于别的构建）；也可以自己给 `--address` / `--search`；
 - **抓包前自动恢复运行**：避免"CPU 被 halt → 只抓到缓冲区快照"（行数 ≤2 时也会提示）；`--no-resume` 可关掉；
 - **`--check-seq`**：自动找出递增计数列并报告稳态最大跳变/丢帧次数（首段追赶不计）。
-- **下行（回灌）也能用**：`rtt-send --data "cmd\n"` —— J-Link 走 pylink 直连 DLL，ST-Link/DAPLink 走 OpenOCD 的 `rtt server`（**它是双向的**：往 socket 写 = 写目标的下行缓冲）。固件侧仍然要轮询 `SEGGER_RTT_HasKey()/GetKey()`。
+- **下行（回灌）也能用**：`rtt-send "x" --expect pong`（第一个参数就是要发的文本，支持 `\n`、`--hex 70,0A`）—— J-Link 走 pylink 直连 DLL，ST-Link/DAPLink 走 OpenOCD 的 `rtt server`（**它是双向的**：往 socket 写 = 写目标的下行缓冲）。固件侧仍然要轮询 `SEGGER_RTT_HasKey()/GetKey()`；`--repeat 20 --interval 100` 连发可测往返延迟（实测 J-Link + G431 是 3~10 ms）。
 RTT 控制块地址：`arm-none-eabi-nm <elf> | grep _SEGGER_RTT`（技能默认已自动解析）。
 **互斥说明**：同一台探针同一时刻只能被一个程序独占 —— J-Link 的 `JLinkRTTLogger` 与 `JLinkGDBServerCL` 互斥（技能抓包前会自动 `stop`）；OpenOCD 的 RTT 与 GDB 服务在同一个进程里，不互斥。别的探针怎么抓观测通道见 PROBES.md。
 

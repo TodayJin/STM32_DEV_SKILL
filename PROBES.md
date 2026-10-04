@@ -61,7 +61,7 @@ OpenOCD（技能用它当 GDB 服务与 RTT 通道）。
 - 现场诊断：`-hf` 官方 HardFault 分析、`-regdump`、`-pwr`（看型号支持）。
 - 自带虚拟串口：一根 USB 同时给 SWD 和串口，少一根线就少一类"收不到数据"的坑 —— 直接配 `serial --port <那个 COM>`。
 - 抓 RTT 日志：`rtt --elf build/x.elf --check-seq` —— 技能自动起 OpenOCD 的 `rtt server`（本地 TCP）并收干净，地址解析与丢帧判定和 J-Link 一个用法。
-- 回灌 RTT 下行：`rtt-send --data "cmd\n"` —— OpenOCD 的 `rtt server` 双向，不用 pylink；固件里仍要轮询 `SEGGER_RTT_HasKey()`。
+- 回灌 RTT 下行：`rtt-send "x" --expect pong`（要发的文本是位置参数）—— OpenOCD 的 `rtt server` 双向，不用 pylink；固件里仍要轮询 `SEGGER_RTT_HasKey()`。
 - 取 RTT 源码：`init-rtt --dir .` —— J-Link 安装目录没有就自动从 SEGGER 官方仓库（BSD）取 6 个文件。
 
 **注意事项**
