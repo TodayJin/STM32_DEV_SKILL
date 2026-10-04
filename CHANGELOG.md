@@ -1,5 +1,31 @@
 # Changelog — stm32-dev 技能
 
+## 3.17.3 (2026-10-11) —— ST-Link 真机全链路跑通（V2 实机）+ 按世代显示
+
+**真机验证（ST-Link/V2 独立型 S/N 37FF71064E5734368D591143 FW V2J46S7 + STM32G431CBT6，interface-adapter 工程）**
+- `probe detect` / `probe info stlink` / `doctor` 都按世代显示：认出 V2，并给出「按这代最优: SWD 1800 kHz(OpenOCD) / 4000 kHz(官方 CLI)」。
+- `flash` 自动通道（官方 CLI）→ `Download verified successfully` + `MCU Reset`；`flash --via openocd` → `Programming Finished` / `Verified OK` / `Resetting Target`。两条路都真烧进去了。
+- `verify` 两条读回都通：CLI `-u 0x08000000 0xAA1C` → VERIFY OK；OpenOCD `dump_image` → `dumped 43548 bytes in 0.403806s (105.316 KiB/s)` → VERIFY OK（读回文件是 `%TEMP%\stm32-dev-verify-read.bin`）。
+- `reset` 两条都通（CLI `-rst`；OpenOCD `init → reset run → shutdown`）。
+- `rtt --seconds 8 --check-seq` 走 OpenOCD `rtt server` 抓到 RTT 行（seq/tick 递增，判定无丢帧）；`rtt-send "x" --expect pong --repeat 20` = **20/20 命中**，单次往返 **108~110 ms**（J-Link 上同一动作 3~10 ms —— OpenOCD 是轮询读 RAM，慢 1~2 个数量级，这条现在有真机数字）。
+- `new` 生成空工程 → `make` 通过 → 烧进板子 → `verify` 与 `newstlink.elf` 逐字节一致 → 再把产品固件 `build/interface-adapter.elf` 烧回并校验一致。测试产物目录已删干净。
+
+**通道自动切换（真机端到端验过）**
+- 官方 CLI 用不了时（克隆件 / 被别的程序占着 / CLI 没装）自动改走 OpenOCD，并**记住**这只探针以后直接走 OpenOCD（写进工程配置 `stlink_channel`；想换回去 `flash --via cli`）。
+- 验证方式：把 `STM32_PROGRAMMER_CLI` 指向一个只打印 `ST-LINK error (DEV_CONNECT_ERR)` 的假脚本 → 技能判定这探针官方 CLI 不可用 → 打印「已记住…」→ 真的用 OpenOCD 把板子烧成 → 再跑一次不带 `--via` 完全没碰假 CLI。
+- 跑官方 CLI 之前先把残留的 OpenOCD 收掉（两者不能同时占同一只 ST-Link）；CLI 一旦报 `DEV_CONNECT_ERR`，`-l` 会退化成假串号（实测 `5&1C422B18&0&7`）—— 所以探测到的串号现在要做合法性校验。
+
+**修：8 个真机暴露的问题**
+1. `rtt` 读抓包文件用平台默认编码 → 中文日志尾部乱码（实测 `[can] Bus-Off 鎭㈠��`）；改成 UTF-8 + `errors="replace"`。
+2. 工程配置带 BOM（记事本 / PowerShell 存过的）时 `json.load` 抛异常 → **整份配置被静默忽略**（探针被退回自动探测）；改用 `utf-8-sig` 读。
+3. 回退到 OpenOCD 时写配置**整份覆盖**，把 `probe` / `stlink_freq` 冲掉；新增 `merge_config()`（只补写不覆盖），`setup --fix` 写探针那处也改用它。
+4. 官方 CLI 认不出探针时 `probe_for_work()` 落到老 J-Link 路径，报误导性的「检查 J-Link 连接/供电」；现在用 OpenOCD 兜底认探针。
+5. 一个探针都没认出来时给一次性提示（怎么看 `probe detect` / 怎么 `probe use` 指定）。
+6. OpenOCD 探出的探针行带着日志前缀（`Info : STLINK V2J46S7 …`），已截断。
+7. 世代能力表用了中文键名 → 能力表不是「覆盖这一行」而是「多出三行」；键名统一成 `swd_clock` / `vcp` / `swo`。
+8. `--via` 的默认值 `auto` 被当成「用户明确指定」→ 环境变量与工程配置全被挡住；现在 `auto` = 没指定，优先级 `--via` > `STM32_DEV_STLINK_CHANNEL` > 工程配置 > auto。
+
+**自检**：新增 14 条断言（世代识别映射 / 按世代时钟 / 能力覆盖 / CLI 失败串识别 / 通道三级优先级 / `stlink_freq` 优先级 / BOM 配置 / 配置合并不冲掉原键），技能目录 `selftest` = **91 条全 PASS**。
 ## 3.17.2 (2026-10-11) —— 真机全链路跑通 + preflight 故障处理器判定分级
 
 **真机验证（J-Link PLUS + STM32G431CBT6，interface-adapter 工程）**

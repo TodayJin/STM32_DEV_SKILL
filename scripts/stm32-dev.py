@@ -519,6 +519,7 @@ class OpenOCDServer:
         if not tgt:
             return None
         args = [openocd, "-f", _OCD_IFACE[self.probe], "-c", "transport select swd"]
+        args += _ocd_speed_arg(self.probe)
         if self.serial:
             args += ["-c", "adapter serial %s" % self.serial]
         # 只留 gdb 端口: telnet/tcl 端口的命令名在 0.11(下划线) / 0.12(空格) 之间变过, 不写就不会踩
@@ -723,6 +724,8 @@ def with_server(device, elf, gdb_commands, resume=True, serial=None):
     _SERVER_KIND = "openocd" if kind in ("stlink", "daplink") else "jlink"
     srv = (OpenOCDServer(dev, GDB_PORT, sn, kind) if _SERVER_KIND == "openocd"
            else JLinkServer(dev, GDB_PORT, sn))
+    # OpenOCD 常是 .cmd 包装件起的, 杀包装件会留下真进程当孤儿占着探针 -> 记下开工前的名单, 收尾杀差集
+    ocd_before = set(_pids_of("openocd")) if _SERVER_KIND == "openocd" else set()
     managed = False
     if srv.is_up():
         if not srv.is_ours():
@@ -752,6 +755,9 @@ def with_server(device, elf, gdb_commands, resume=True, serial=None):
                 except Exception:
                     pass
             srv._clear_pid()
+            if _SERVER_KIND == "openocd":
+                for _p in sorted(set(_pids_of("openocd")) - ocd_before):
+                    _kill_pid(_p)
 
 
 def infer_elf():
@@ -809,8 +815,14 @@ def cmd_doctor(args):
     for k, v in status.items():
         print("  [%s] %s" % ("OK" if v.startswith("OK") else "!!", v))
     if pid:
+        if pid == "stlink":
+            _v, _vwhy = _stlink_variant_probe()
+            if _v:
+                print("  [OK] 这一代: %s   (%s)" % (_stlink_profile(_v)["label"], _vwhy))
+                print("       SWD 时钟按这代给: %d kHz(OpenOCD) / %d kHz(官方 CLI)" %
+                      (_stlink_freq(args, "ocd"), _stlink_freq(args, "cli")))
         print("  [OK] 这次用: %s   (依据: %s%s)" % (PROBE_DEFS[pid]["name"], why,
-              (", 序列号 " + serial) if serial else ""))
+                  (", 序列号 " + serial) if serial else ""))
     tool_ok = {"jlink": bool(jlink), "stlink": bool(stcli), "daplink": bool(ocd)}.get(pid,
                                                                                      bool(jlink or stcli or ocd))
 
@@ -1426,13 +1438,85 @@ def _dry_stop(argv):
     raise _DryRun()
 
 
+_STLINK_CLI_DEAD = False     # 这只 ST-Link 官方 CLI 用不了(克隆件/被别的程序占着): 记住, 直接走 OpenOCD
+_PROBE_WARNED = False        # "一个调试器都没探测到"这条提示只打一次
+
+
+def _stlink_channel(args=None):
+    """ST-Link 的烧录/校验走哪条软件栈: 官方 CLI 还是 OpenOCD。
+    优先级: --via > 环境变量 STM32_DEV_STLINK_CHANNEL > 工程配置 > auto。"""
+    # 注意 --via 的默认值就是 "auto"(=没指定), 不能当成"用户明确要求 auto"把环境变量/配置挡掉。
+    c = (getattr(args, "via", "") if args else "").strip().lower()
+    if c in ("cli", "openocd"):
+        return c
+    e = os.environ.get("STM32_DEV_STLINK_CHANNEL", "").strip().lower()
+    if e in ("cli", "openocd"):
+        return e
+    try:
+        c = str((load_config() or {}).get("stlink_channel", "") or "").strip().lower()
+    except Exception:
+        c = ""
+    return c if c in ("cli", "openocd") else "auto"
+
+
+def _stlink_cli_blocked(low):
+    """官方 CLI 报的是"这只探针用不了"(克隆件/被占), 不是接线或芯片问题 -> 该换通道。"""
+    return any(k in low for k in ("dev_connect_err", "not a genuine st device",
+                                  "no debug probe detected", "unable to connect to st-link",
+                                  "error in initializing st-link device", "st-link is not"))
+
+
+def _free_stlink_for_cli(verbose=False):
+    """官方 CLI 与 OpenOCD 不能同时占同一只 ST-Link: 跑 CLI 前先把我们上次留下的 OpenOCD 收掉。
+    真机踩到: 残留 openocd 占着探针 -> CLI 报 DEV_CONNECT_ERR, 而且 -l 会吐一个假串号。"""
+    pids = _pids_of("openocd")
+    srv = OpenOCDServer("", GDB_PORT, "")
+    if srv.is_up():
+        srv.stop()
+        if verbose:
+            print("先把上次留下的 OpenOCD 收掉(它占着探针, 官方 CLI 会连不上)。")
+        time.sleep(0.5)
+        pids = _pids_of("openocd")
+    if pids and verbose:
+        print("注意: 还有别的 OpenOCD 在跑(pid %s) —— IDE / ST-LINK_gdbserver 也会抢探针。" %
+              ", ".join(str(p) for p in pids[:4]))
+    return pids
+
+
+def _flash_stlink_via_ocd(args):
+    """官方 CLI 用不了 -> 换 OpenOCD 走同一只 ST-Link(硬件没变, 只换软件栈)。"""
+    global _STLINK_CLI_DEAD
+    _STLINK_CLI_DEAD = True
+    print("-> 改用 OpenOCD 烧这只 ST-Link(同一根 USB, 只是换个软件栈)。")
+    rc = _flash_openocd(args, "stlink")
+    if rc == 0:
+        merge_config({"stlink_channel": "openocd"})
+        print("  已记住: 这只 ST-Link 以后直接走 OpenOCD(想换回官方 CLI: flash --via cli)。")
+    else:
+        print("  OpenOCD 也没烧成 -> 看上面的 openocd 报错; 先 cleanup 收掉占探针的进程再试。")
+    return rc
+
+
+def add_stlink_args(s):
+    """ST-Link 专用开关: 走哪条软件栈 / SWD 时钟给多少。"""
+    s.add_argument("--via", choices=["auto", "cli", "openocd"], default="auto",
+                   help="ST-Link 烧录/校验走哪条: auto=先试官方 CLI, 用不了自动换 OpenOCD(默认)")
+    s.add_argument("--freq", type=int, default=0,
+                   help="SWD 时钟 kHz(默认按这只 ST-Link 的世代给最优值: V2 1800 / V3 4000)")
+
+
 def _flash_stlink(args):
     """ST-Link 后端烧录: STM32_Programmer_CLI -w(写) -v(官方逐字节校验) -rst(复位运行)。
-    比 J-Link 强的一点: 校验由官方工具做, 退出码可信, 不用再拉一次 gdb 去比对。"""
+    比 J-Link 强的一点: 校验由官方工具做, 退出码可信, 不用再拉一次 gdb 去比对。
+    官方 CLI 用不了这只探针(克隆件/被占)时自动换 OpenOCD, 不用人管。"""
+    if _stlink_channel(args) == "openocd" or _STLINK_CLI_DEAD:
+        print("ST-Link 走 OpenOCD 通道(这只探针的官方 CLI 用不了, 或你指定了 openocd)。")
+        return _flash_openocd(args, "stlink")
     cli = find_stm32_cli()
     if not cli:
         print("ERROR: 找不到 STM32_Programmer_CLI(装 STM32CubeCLT / CubeProgrammer, 或设 STM32_PROGRAMMER_CLI)")
-        return 1
+        print("  也可以直接走 OpenOCD 通道: flash --via openocd")
+        return _flash_openocd(args, "stlink")
     elf = args.elf or infer_elf()
     target = args.hex or ((os.path.splitext(elf)[0] + ".hex") if elf else None)
     if target and not os.path.isfile(target) and elf and os.path.isfile(elf):
@@ -1440,7 +1524,9 @@ def _flash_stlink(args):
     if not target or not os.path.isfile(target):
         print("ERROR: 找不到要烧的文件(--hex 或 ELF): %s" % (target or args.hex or "(无)"))
         return 1
-    conn = _stlink_conn(_stlink_serial(args), mode="UR" if getattr(args, "ur", False) else "")
+    _free_stlink_for_cli(verbose=True)
+    conn = _stlink_conn(_stlink_serial(args), freq=_stlink_freq(args, "cli"),
+                        mode="UR" if getattr(args, "ur", False) else "")
     cmd = [cli, "-c", conn, "-w", target]
     if args.no_verify:
         print("VERIFY: 已按 --no-verify 跳过(未校验板子固件)。")
@@ -1467,21 +1553,30 @@ def _flash_stlink(args):
         print("  ST-Link 官方 -v 已逐字节校验; 已复位运行。")
         jset(flashed=True, hex=target, probe="stlink", verified=not args.no_verify)
         return 0
+    if _stlink_cli_blocked(low):
+        print("ST-Link 官方 CLI 用不了这只探针(克隆件 / 探针被别的程序占着)。")
+        if _stlink_channel(args) == "cli":
+            print("  你指定了 --via cli, 那就自己处理: 关掉占探针的程序(IDE、ST-LINK_gdbserver), 或换只非克隆的 ST-Link。")
+            return 1
+        return _flash_stlink_via_ocd(args)
     print("FLASH 失败(原因看上面的官方输出): 探针/接线/供电/读保护。")
-    if ("not a genuine st device" in low) or ("no st-link" in low) or ("no stlink" in low):
-        print("  没认到 ST-Link: 换 USB 口/线, 关掉占用它的程序(IDE、stlinkserver); 克隆件只能走 OpenOCD。")
+    if ("no st-link" in low) or ("no stlink" in low):
+        print("  没认到 ST-Link: 换 USB 口/线, 关掉占用它的程序(IDE、stlinkserver)。")
     if ("read out protection" in low) or ("rdp" in low):
         print("  被读保护挡住: %s -c \"%s\" -rdu   (解保护会全片擦除)" % (cli, conn))
     return 1
 
 
 def _reset_stlink(args):
-    """ST-Link 后端复位: 官方 CLI -rst(复位完自动运行)。"""
+    """ST-Link 后端复位: 官方 CLI -rst(复位完自动运行); CLI 用不了这只探针时换 OpenOCD。"""
+    if _stlink_channel(args) == "openocd" or _STLINK_CLI_DEAD:
+        return _reset_openocd(args, "stlink")
     cli = find_stm32_cli()
     if not cli:
         print("ERROR: 找不到 STM32_Programmer_CLI")
-        return 1
-    conn = _stlink_conn(_stlink_serial(args))
+        return _reset_openocd(args, "stlink")
+    _free_stlink_for_cli(verbose=True)
+    conn = _stlink_conn(_stlink_serial(args), freq=_stlink_freq(args, "cli"))
     cmd = [cli, "-c", conn, "-rst"]
     print("ST-Link 复位: %s" % " ".join(cmd))
     _dry_stop(cmd)
@@ -1493,6 +1588,9 @@ def _reset_stlink(args):
     out = (r.stdout or "") + (r.stderr or "")
     print(out[-800:])
     ok = (r.returncode == 0) and ("error" not in out.lower())
+    if not ok and _stlink_cli_blocked(out.lower()) and _stlink_channel(args) != "cli":
+        print("ST-Link 官方 CLI 用不了这只探针 -> 改用 OpenOCD 复位。")
+        return _reset_openocd(args, "stlink")
     print("RESET %s (ST-Link)" % ("OK" if ok else "失败"))
     return 0 if ok else 1
 
@@ -1511,6 +1609,7 @@ def _ocd_prog_argv(probe, serial, device):
         return None
     argv = _argv_for(ocd, "-f", _OCD_IFACE.get(probe, "interface/cmsis-dap.cfg"),
                      "-c", "transport select swd")
+    argv += _ocd_speed_arg(probe)
     if serial:
         argv += ["-c", "adapter serial %s" % serial]
     argv += ["-f", "target/%s.cfg" % tgt]
@@ -1922,7 +2021,7 @@ def _rtt_report(args, outfile, logfile=None, hints=None):
     data = ""
     if os.path.isfile(outfile):
         try:
-            with open(outfile, "r", errors="replace") as f:
+            with open(outfile, "r", encoding="utf-8", errors="replace") as f:
                 data = f.read()
         except OSError:
             pass
@@ -1938,7 +2037,7 @@ def _rtt_report(args, outfile, logfile=None, hints=None):
             print("   " + h)
         if logfile and os.path.isfile(logfile):
             try:
-                with open(logfile, "r", errors="replace") as f:
+                with open(logfile, "r", encoding="utf-8", errors="replace") as f:
                     print("   --- 后台日志尾部 ---")
                     print("\n".join(f.read().splitlines()[-15:]))
             except OSError:
@@ -2551,8 +2650,123 @@ def _elf_load_info(elf):
     return base, end - base
 
 
+def _verify_prepare(args, elf=None):
+    """校验的公共准备: 找 ELF -> objcopy 出二进制 -> 取 LOAD 段范围。
+    返回 (elf, base, size, data); 出错打印原因并返回 None。"""
+    elf = elf or getattr(args, "elf", None) or infer_elf()
+    if not elf or not os.path.isfile(elf):
+        print("ERROR: 未找到 ELF。请 --elf 指定。")
+        return None
+    objcopy = find_objcopy()
+    if not objcopy:
+        print("ERROR: 找不到 arm-none-eabi-objcopy。")
+        return None
+    info = _elf_load_info(elf)
+    if not info:
+        print("ERROR: 解析 ELF LOAD 段失败(需要 arm-none-eabi-readelf)。")
+        return None
+    base, size = info
+    tmp_bin = os.path.join(tempfile.gettempdir(), "stm32-dev-verify.bin")
+    try:
+        subprocess.run([objcopy, "-O", "binary", elf, tmp_bin], capture_output=True, timeout=60, check=True)
+    except Exception as e:
+        print("ERROR: objcopy 失败: %s" % e)
+        return None
+    try:
+        data = open(tmp_bin, "rb").read()[:size]
+    except OSError as e:
+        print("ERROR: 读 %s 失败: %s" % (tmp_bin, e))
+        return None
+    return (elf, base, len(data), data)
+
+
+def _verify_compare(args, elf, base, data, b, how=""):
+    """公共比对: 本地镜像 vs 从板子读回的那串字节。两边读回通道(官方 CLI / OpenOCD)都走这里。"""
+    n = min(len(data), len(b))
+    diffs = [i for i in range(n) if data[i] != b[i]]
+    ok = (not diffs) and len(data) == len(b)
+    jset(elf=elf, base=base, size=len(data), diff_bytes=len(diffs), match=ok, via=how)
+    if ok:
+        print("VERIFY OK: 板子固件与 %s 完全一致。" % os.path.basename(elf))
+        return 0
+    print("!! VERIFY FAIL: 板子上的固件和 %s 不一样。" % os.path.basename(elf))
+    print("   ---- 这就是坑#9(板子在跑旧固件), 先别查代码, 先把烧录搞对 ----")
+    if len(data) != len(b):
+        print("   长度不一致: ELF %d vs 板子 %d" % (len(data), len(b)))
+    print("   不同字节: %d / %d" % (len(diffs), n))
+    for i in diffs[:5]:
+        print("   0x%08X: ELF=0x%02X 板子=0x%02X" % (base + i, data[i], b[i]))
+    if len(diffs) > 5:
+        print("   ...")
+    print("   -> 重新烧: %s %s flash --elf %s" % (sys.executable or "python", os.path.abspath(__file__), elf))
+    return 1
+
+
+def _ocd_dump_argv(probe, serial, device, base, size, outfile, args=None):
+    """OpenOCD 把 Flash 读回文件的命令行: 官方 CLI 用不了这只 ST-Link 时的备份通道, DAPLink 也用它。"""
+    ocd = find_openocd()
+    if not ocd:
+        print("ERROR: 没找到 openocd(读回校验要用它; 见 SETUP.md)。")
+        return None
+    tgt = _ocd_target(device)
+    if not tgt:
+        print("ERROR: 认不出 %s 对应的 openocd 目标脚本。" % device)
+        return None
+    argv = _argv_for(ocd, "-f", _OCD_IFACE.get(probe, "interface/cmsis-dap.cfg"),
+                     "-c", "transport select swd")
+    argv += _ocd_speed_arg(probe, args)
+    if serial:
+        argv += ["-c", "adapter serial %s" % serial]
+    argv += ["-f", "target/%s.cfg" % tgt, "-c", "init", "-c", "halt",
+             "-c", "dump_image \"%s\" 0x%08X 0x%X" % (outfile.replace("\\", "/"), base, size),
+             "-c", "catch {resume}", "-c", "shutdown"]
+    return argv
+
+
+def _verify_via_ocd(args, probe, prep=None, why=""):
+    """用 OpenOCD 读回板子 Flash 再逐字节比。
+    两条路都会走到这里: ST-Link 的官方 CLI 用不了(克隆件/被占), 以及 DAPLink。"""
+    if prep is None:
+        prep = _verify_prepare(args)
+    if not prep:
+        return 1
+    elf, base, size, data = prep
+    fl = os.path.join(tempfile.gettempdir(), "stm32-dev-verify-read.bin")
+    try:
+        os.remove(fl)      # 旧文件必须删: 不然会把上次读回的结果当成这次的结果
+    except OSError:
+        pass
+    dev = resolve_device(args, elf)
+    serial = _stlink_serial(args) if probe == "stlink" else (args.serial if (args.serial or "") != DEFAULT_SERIAL else "")
+    argv = _ocd_dump_argv(probe, serial, dev, base, size, fl, args)
+    if not argv:
+        return 1
+    if why:
+        print("(%s)" % why)
+    print("ELF 镜像: base=0x%08X size=%d -> 用 OpenOCD 从板子读回 Flash 比对..." % (base, size))
+    r = _run_openocd(argv, timeout=max(120, size // 256))
+    if r is None:
+        print("ERROR: 起 openocd 失败。")
+        return 1
+    out = ((r.stdout or "") + (r.stderr or ""))
+    print(out[-800:])
+    if not (r.returncode == 0 and os.path.isfile(fl) and os.path.getsize(fl) > 0):
+        _ocd_fail_hint(out)
+        print("ERROR: OpenOCD 读回 Flash 失败。")
+        return 1
+    try:
+        b = open(fl, "rb").read()
+    except OSError as e:
+        print("ERROR: 读 %s 失败: %s" % (fl, e))
+        return 1
+    return _verify_compare(args, elf, base, data, b, how="OpenOCD")
+
+
 def _verify_stlink(args):
-    """ST-Link 的刷后校验: 从板子读回 Flash, 与本地镜像逐字节比(J-Link 路径同一条铁律)。"""
+    """ST-Link 的刷后校验: 从板子读回 Flash, 与本地镜像逐字节比(J-Link 路径同一条铁律)。
+    官方 CLI 读不回来(克隆件/被占)时自动换 OpenOCD, 不用人管。"""
+    if _stlink_channel(args) == "openocd" or _STLINK_CLI_DEAD:
+        return _verify_via_ocd(args, "stlink", why="这只 ST-Link 走 OpenOCD 通道")
     elf = args.elf or infer_elf()
     if not elf or not os.path.isfile(elf):
         print("ERROR: 未找到 ELF。请 --elf 指定。")
@@ -2584,7 +2798,8 @@ def _verify_stlink(args):
     data = open(tmp_bin, "rb").read()[:size]
     size = len(data)
     print("ELF 镜像: base=0x%08X size=%d -> 用 ST-Link 从板子读回 Flash 比对..." % (base, size))
-    conn = _stlink_conn(_stlink_serial(args))
+    _free_stlink_for_cli(verbose=True)
+    conn = _stlink_conn(_stlink_serial(args), freq=_stlink_freq(args, "cli"))
     argv = [cli, "-c", conn, "-u", "0x%08X" % base, "0x%X" % size, tmp_read]
     print("  %s" % " ".join(argv))
     try:
@@ -2595,16 +2810,16 @@ def _verify_stlink(args):
     out = (r.stdout or "") + (r.stderr or "")
     if r.returncode != 0 or not os.path.isfile(tmp_read):
         print(out[-900:])
+        if _stlink_cli_blocked(out.lower()):
+            print("ST-Link 官方 CLI 用不了这只探针(克隆件 / 探针被别的程序占着)。")
+            if _stlink_channel(args) == "cli":
+                return 1
+            return _verify_via_ocd(args, "stlink", prep=(elf, base, size, data),
+                                   why="改用 OpenOCD 读回校验")
         print("ERROR: 读回 Flash 失败(上面 Error 那行是原因; 没插探针也会这样)。")
         return 1
     b = open(tmp_read, "rb").read()
-    n = min(len(data), len(b))
-    diffs = [i for i in range(n) if data[i] != b[i]]
-    ok = (not diffs) and len(data) == len(b)
-    jset(elf=elf, base=base, size=size, diff_bytes=len(diffs), match=ok)
-    if ok:
-        print("VERIFY OK: 板子固件与 %s 完全一致。" % os.path.basename(elf))
-        return 0
+    return _verify_compare(args, elf, base, data, b, how="ST-Link 官方 CLI")
     print("!! VERIFY FAIL: 板子上的固件和 %s 不一样。" % os.path.basename(elf))
     print("   ---- 这就是坑#9(板子在跑旧固件), 先别查代码, 先把烧录搞对 ----")
     if len(data) != len(b):
@@ -2624,10 +2839,7 @@ def cmd_verify(args):
     if kind == "stlink":
         return _verify_stlink(args)
     if kind == "daplink":
-        print("!! DAPLink 这条路的独立校验还没做。")
-        print("   烧录自带逐字节校验: flash 成功就是验过的; 要单独再验一次:")
-        print("   装 pyOCD 后 pyocd commander -t <型号> -c \"read32 0x08000000\" (或用 ST-Link/J-Link 交叉验证)。")
-        return 1
+        return _verify_via_ocd(args, "daplink", why="DAPLink 的读回校验走 OpenOCD")
     elf = args.elf or infer_elf()
     if not elf or not os.path.isfile(elf):
         print("ERROR: 未找到 ELF。请 --elf 指定。")
@@ -3017,6 +3229,61 @@ def cmd_selftest(args):
         and _rtt_paths.get("SEGGER_RTT_ASM_ARMv7M.S", "").startswith("RTT/")
         and _rtt_paths.get("SEGGER_RTT_Conf.h") == "Config/SEGGER_RTT_Conf.h")
     chk("init-rtt --offline 时不去联网", _fetch_rtt_sources(tempfile.gettempdir(), offline=True) == [])
+
+    # --- ST-Link: 世代识别 / 通道自动切换 / 工程配置健壮性(都在真机 ST-Link V2 上踩出来) ---
+    chk("ST-Link 世代: USB PID 优先",
+        _stlink_variant("", "", "0483:3748")[0] == "v2"
+        and _stlink_variant("", "", "0483:374b")[0] == "v2-1"
+        and _stlink_variant("", "", "0483:374e")[0] == "v3")
+    chk("ST-Link 世代: 没 PID 时看固件串, 板载板名分 V2-1",
+        _stlink_variant("V2J46S7", "")[0] == "v2"
+        and _stlink_variant("V2J28M18", "NUCLEO-G431RB")[0] == "v2-1"
+        and _stlink_variant("V3J15M7", "")[0] == "v3"
+        and _stlink_variant("", "")[0] == "")
+    chk("ST-Link 世代: V2 与 V3 的最优 SWD 时钟不同",
+        _stlink_profile("v2")["freq_ocd"] == 1800 and _stlink_profile("v2")["freq_cli"] == 4000
+        and _stlink_profile("v3")["freq_ocd"] == 4000 and _stlink_profile("v3")["freq_cli"] == 8000)
+    chk("ST-Link 世代: 能力表按世代覆盖(独立 V2 没有虚拟串口)",
+        _caps_of("stlink", "v2").get("vcp", "").startswith("没有")
+        and _caps_of("stlink", "v3").get("vcp", "").startswith("有(")
+        and _caps_of("stlink", "v2").get("swd_clock", "").startswith("1.8")
+        and _caps_of("stlink", "v3").get("swd_clock", "").startswith("8 "))
+    chk("ST-Link 通道: CLI 报\"这只探针用不了\"才换道(真机原文)",
+        _stlink_cli_blocked("st-link error (dev_connect_err)")
+        and _stlink_cli_blocked("error: not a genuine st device")
+        and _stlink_cli_blocked("no debug probe detected")
+        and not _stlink_cli_blocked("download verified successfully")
+        and not _stlink_cli_blocked(""))
+    chk("OpenOCD 时钟参数: 只给 ST-Link 加, DAPLink 不加",
+        _ocd_speed_arg("stlink")[0] == "-c" and _ocd_speed_arg("daplink") == [])
+    _dch = tempfile.mkdtemp(prefix="stm32ch")
+    _cwd0 = os.getcwd()
+    try:
+        os.chdir(_dch)
+        save_config({"stlink_channel": "openocd", "stlink_freq": 1234})
+        _a_auto = build_parser().parse_args(["flash"])
+        _a_cli = build_parser().parse_args(["flash", "--via", "cli"])
+        chk("ST-Link 通道: 没给 --via 时按工程配置走", _stlink_channel(_a_auto) == "openocd")
+        chk("ST-Link 通道: --via 压过工程配置", _stlink_channel(_a_cli) == "cli")
+        os.environ["STM32_DEV_STLINK_CHANNEL"] = "cli"
+        chk("ST-Link 通道: 环境变量也压过工程配置", _stlink_channel(_a_auto) == "cli")
+        del os.environ["STM32_DEV_STLINK_CHANNEL"]
+        chk("SWD 时钟: 工程配置压过世代默认", _stlink_freq(_a_auto, "ocd") == 1234)
+        chk("SWD 时钟: --freq 压过工程配置",
+            _stlink_freq(build_parser().parse_args(["flash", "--freq", "6000"]), "ocd") == 6000)
+        os.remove(config_file())
+        chk("ST-Link 通道: 没有配置时是 auto", _stlink_channel(_a_auto) == "auto")
+        # 记事本 / PowerShell 存的 json 带 BOM: 用 utf-8 读会抛异常 -> 整份配置被静默忽略(真机踩到)
+        with open(config_file(), "wb") as _fh:
+            _fh.write(b"\xef\xbb\xbf" + b'{"stlink_channel": "openocd"}')
+        chk("工程配置: 带 BOM 也读得出来", _stlink_channel(_a_auto) == "openocd")
+        merge_config({"probe": "stlink"})
+        _cf = load_config()
+        chk("工程配置: merge_config 是补写, 不冲掉原有设置",
+            _cf.get("stlink_channel") == "openocd" and _cf.get("probe") == "stlink")
+    finally:
+        os.chdir(_cwd0)
+        shutil.rmtree(_dch, ignore_errors=True)
 
     print("SELFTEST: %s" % ("PASS" if ok else "FAIL"))
     jset(checks=checks, result=("PASS" if ok else "FAIL"))
@@ -3671,17 +3938,17 @@ def find_openocd():
     """OpenOCD: 多探针通用的 gdb server, 也是非 J-Link 探针跑 RTT/SWO 的唯一通道。"""
     env = os.environ.get("OPENOCD")
     if env and os.path.isfile(env):
-        return env
+        return _unwrap_cmd(env)
     for n in ("openocd", "openocd.exe", "openocd.cmd", "openocd.bat"):
         p = shutil.which(n)
         if p:
-            return p
-    return _glob_first([
+            return _unwrap_cmd(p)
+    return _unwrap_cmd(_glob_first([
         "~/.local/bin/openocd*",
         "~/.local/share/xpack*/bin/openocd*",
         "~/AppData/Local/Microsoft/WinGet/Links/openocd*",
         "/usr/bin/openocd", "/usr/local/bin/openocd", "/opt/homebrew/bin/openocd",
-    ])
+    ]))
 
 
 def find_stlink_gdbserver():
@@ -3770,27 +4037,29 @@ PROBE_DEFS = {
         ],
     },
     "stlink": {
-        "name": "ST-Link V2 / V3 (V3SET, V3MINI, V3MINIE)",
-        "matches": ["ST-Link V2", "ST-Link V3SET", "ST-Link V3MINI", "ST-Link V3MINIE", "板载 ST-Link"],
+        "name": "ST-Link V2 / V2-1 / V3(世代不同, 能力差得远, 技能按世代自动选参数)",
+        "matches": ["ST-Link V2(独立小 U 盘/克隆件最多)", "ST-Link V2-1(Nucleo/Discovery 板载)",
+                    "ST-Link V3SET", "ST-Link V3MINI", "ST-Link V3MINIE"],
         "caps": {
             "flash": "STM32_Programmer_CLI -w(有返回码) 或 OpenOCD program",
             "flash_verify": "STM32_Programmer_CLI -w -v(官方逐字节校验, 退出码可信)",
             "rtt_up": "OpenOCD rtt(轮询 RAM, 吞吐低 1~2 个数量级)",
-            "rtt_down": "OpenOCD rtt server 理论可写, 本技能还没接命令/没实测",
+            "rtt_down": "OpenOCD rtt server 是双向的(rtt-send 走它, 不用额外库)",
             "swo": "V3 的 SWO 可用, 但 OpenOCD hla 驱动要手配 swo/tpiu(单 AP 限制)",
-            "vcp": "V3 自带虚拟串口(一根 USB 同时给 SWD + 串口)",
+            "vcp": "V3 与板载 V2-1 有虚拟串口(一根 USB 同时给 SWD + 串口); 独立 V2 没有",
             "option_bytes": "STM32_Programmer_CLI -ob(读保护/BOR/WRP/boot 全支持)",
             "recover": "最好: -c mode=UR/HOTPLUG + -rdu 读保护救援",
             "fault_analysis": "自带: STM32_Programmer_CLI -hf 分析 HardFault",
             "semihosting": "ST-LINK_gdbserver --semihosting 支持",
             "multi_probe": "-i <序列号> 或 OpenOCD adapter serial",
-            "swd_clock": "V3 SWD 默认 8MHz, JTAG 21.333MHz",
+            "swd_clock": "按世代: V2 约 1.8MHz(实测), V3 默认 8MHz(最高 24MHz)",
         },
         "best": "调 STM32 的官方一等公民: 烧录带逐字节校验和真退出码, 选项字节/读保护/救砖最顺手, 还自带 HardFault 分析器和虚拟串口。",
         "notes": [
             "STM32_Programmer_CLI 和 ST-LINK_gdbserver 会抢同一根 ST-Link; 烧录前先停 gdb server。",
             "本机可能同时存在 ST 的 stlinkserver.exe 和 CubeCLT 里那个, 两个都开就抢设备(现象是时好时坏)。",
-            "克隆/山寨 ST-Link 会被官方 CLI 直接拒(报 not a genuine ST device), 只能退回 OpenOCD。",
+            "克隆/山寨 ST-Link 会被官方 CLI 直接拒(报 DEV_CONNECT_ERR / not a genuine ST device): 技能会自动改走 OpenOCD, 烧录/校验/调试/RTT 一样能做。",
+            "官方 CLI 与 OpenOCD 不能同时占同一只 ST-Link: 技能跑 CLI 前会先收掉自己留下的 OpenOCD; 是别人(IDE/ST-LINK_gdbserver)占着就得你自己关。",
             "OpenOCD 的 hla(ST-Link)驱动有单 AP 限制: SWO/RTT 要手动给 -ap-num/-baseaddr; SWO 时钟配错会让芯片调试口锁死到重新上电。",
             "OpenOCD RTT 是轮询内存, 抓包丢的行里混着工具侧丢帧, 不能再当固件丢帧证据。",
             "V3MINI/V3MINIE 是精简版, 是否引出 SWO 引脚要先看板子(只有 SWD 四针时用 RTT/虚拟串口, 别指望 SWO)。",
@@ -3861,11 +4130,22 @@ def load_config(root=None):
     """读工程根配置; 读不到就给空 dict(不是错误)。"""
     path = config_file(root)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # utf-8-sig: 记事本/PowerShell 存过的配置带 BOM, 用 utf-8 读会直接抛异常 -> 整份配置被静默忽略。
+        with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def merge_config(patch, root=None):
+    """往工程配置里补几条, 不碰已经有的。
+
+    踩到过: 回退到 OpenOCD 时 save_config({"stlink_channel": "openocd"}) 会把工程配置里
+    原有的 probe/serial 整份冲掉 —— 配置是"工程级设置", 只能补写, 不能整份覆盖。"""
+    cfg = load_config(root)
+    cfg.update(patch or {})
+    return save_config(cfg, root)
 
 
 def save_config(cfg, root=None):
@@ -3876,6 +4156,179 @@ def save_config(cfg, root=None):
             fh.write("\n")
     except Exception as e:
         raise SkillError("写配置失败 %s: %s" % (path, e))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# ST-Link 的"世代"(版本)识别: V2 / V2-1 / V3 的能力差得很远, 选路和参数都跟着变
+#   真机踩到: ST-Link/V2(克隆件) 官方 CLI 报 DEV_CONNECT_ERR, OpenOCD 却能连,
+#             而且 OpenOCD 要 2000kHz 只给 1800kHz -> 时钟要按这一代给, 不能一律 4000/8000。
+# ---------------------------------------------------------------------------
+_STLINK_PID_VARIANTS = {
+    "3744": "v2", "3748": "v2", "3752": "v2",            # ST-Link/V2(独立小U盘)与克隆件
+    "374B": "v2-1", "374D": "v2-1",                      # 板载 V2-1(Nucleo/Discovery)
+    "374E": "v3", "374F": "v3", "3753": "v3", "3754": "v3",
+}
+
+_STLINK_PROFILE = {
+    "v2": {
+        "label": "ST-Link/V2(独立小 U 盘那种; 克隆件最多)",
+        "freq_cli": 4000, "freq_ocd": 1800,
+        "caps": {
+            # 键名必须和基础能力表一致, 否则是"多出一行"而不是"覆盖这一行"
+            "swd_clock": "1.8 MHz(OpenOCD 实测; 官方 CLI 走 4000)",
+            "vcp": "没有(独立 V2 不带虚拟串口)",
+            "swo": "引脚上有, 克隆件常没引出; 通道慢(约 1~2 Mbit/s)",
+        },
+        "notes": [
+            "克隆件会被 ST 官方 CLI 拒(DEV_CONNECT_ERR / not a genuine ST device) -> 技能自动改走 OpenOCD, 烧录/校验/调试/RTT 一样能做",
+            "官方 CLI 与 OpenOCD 不能同时占同一只 ST-Link: 跑 CLI 前技能会先把残留的 OpenOCD 收掉(收不干净 CLI 就报 DEV_CONNECT_ERR)",
+            "STM32CubeIDE / ST-LINK_gdbserver / 另一个 openocd 也会抢它, 报连不上先想这个",
+        ],
+    },
+    "v2-1": {
+        "label": "ST-Link/V2-1(Nucleo / Discovery 板载)",
+        "freq_cli": 4000, "freq_ocd": 1800,
+        "caps": {
+            "swd_clock": "1.8~4 MHz(和 V2 同档)",
+            "vcp": "有(板载, 和 SWD 共用同一根 USB)",
+            "swo": "有(要引线)",
+        },
+        "notes": [
+            "板载版跟着开发板一起上电/复位, 调试时别把整板 USB 拔了",
+            "虚拟串口和 SWD 共用一根 USB: 串口观测与调试可以同时开, 不互相抢",
+        ],
+    },
+    "v3": {
+        "label": "ST-Link/V3(V3SET / V3MINI / V3MINIE)",
+        "freq_cli": 8000, "freq_ocd": 4000,
+        "caps": {
+            "swd_clock": "8 MHz(最高可到 24 MHz)",
+            "vcp": "有(V3SET 有 3 个)",
+            "swo": "有, 而且快得多(高速 trace 通道)",
+        },
+        "notes": [
+            "V3 的 SWD 时钟和虚拟串口都更多, 大工程烧录/单步明显更顺",
+            "V3MINI / V3MINIE 是精简版: 没 V3SET 那些额外接口, 但高速 SWD/SWO 都在",
+        ],
+    },
+}
+
+_STLINK_VAR_CACHE = None
+
+
+def _stlink_variant(fw="", board="", vidpid=""):
+    """这只 ST-Link 是哪一代: v2 / v2-1 / v3(判不出来返回空串, 不猜)。
+    依据优先级: USB PID(硬事实) > 固件串 V2J../V3J..(再用板载板名区分 V2 还是 V2-1)。"""
+    m = re.search(r"([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})", vidpid or "")
+    if m:
+        v = _STLINK_PID_VARIANTS.get(m.group(2).upper())
+        if v:
+            return v, "USB PID %s" % m.group(2).upper()
+    f = (fw or "").strip().upper()
+    m = re.match(r"V(\d)", f)
+    if m:
+        if m.group(1) == "3":
+            return "v3", "固件 %s" % f
+        if m.group(1) == "2":
+            if (board or "").strip():
+                return "v2-1", "固件 %s + 板载板名" % f
+            return "v2", "固件 %s" % f
+    return "", ""
+
+
+def _openocd_probe_line(verbose=False):
+    """跑一次 openocd 看它怎么描述探针, 例: STLINK V2J46S7 (API v2) VID:PID 0483:3748。
+    官方 CLI 认不出克隆件时, 这行是唯一能拿到探针型号/版本的地方。"""
+    if OpenOCDServer("", GDB_PORT, "", "stlink").is_up():
+        return ""      # 已经有 openocd 占着探针, 别再起一个去抢
+    ocd = find_openocd()
+    if not ocd:
+        return ""
+    tgt = _ocd_target("STM32G431CB") or "stm32g4x"
+    argv = _argv_for(ocd, "-f", "interface/stlink.cfg", "-c", "transport select swd",
+                     "-f", "target/%s.cfg" % tgt, "-c", "init", "-c", "shutdown")
+    out = _run_quiet(argv, timeout=25)
+    for ln in out.splitlines():
+        up = ln.upper()
+        if "STLINK" in up:
+            # 去掉 openocd 的日志前缀(例 "Info : STLINK V2J46S7 (API v2) VID:PID 0483:3748")
+            return ln[up.index("STLINK"):].strip()
+    return ""
+
+
+def _stlink_variant_probe(deep=False, verbose=False):
+    """现在插着的 ST-Link 是哪一代 -> (variant, 依据)。deep=True 时允许跑一次 openocd 兜底。"""
+    global _STLINK_VAR_CACHE
+    if _STLINK_VAR_CACHE:
+        return _STLINK_VAR_CACHE
+    res = ("", "")
+    for h in detect_stlink(verbose=verbose):
+        v, why = _stlink_variant(h.get("fw", ""), h.get("board", ""), "")
+        if v:
+            res = (v, "官方 CLI: " + why)
+            break
+    if not res[0] and deep:
+        v, why = _stlink_variant("", "", _openocd_probe_line(verbose=verbose))
+        if v:
+            res = (v, "OpenOCD: " + why)
+    if res[0]:
+        _STLINK_VAR_CACHE = res
+    return res
+
+
+def _stlink_profile(variant=""):
+    return _STLINK_PROFILE.get(variant) or {}
+
+
+def _caps_of(pid, variant=""):
+    """这个探针(含具体世代)实际能做到什么: 基础能力表 + 世代覆盖。"""
+    caps = dict(PROBE_DEFS.get(pid, {}).get("caps", {}))
+    if pid == "stlink":
+        caps.update(_stlink_profile(variant).get("caps", {}))
+    return caps
+
+
+def _stlink_freq(args=None, channel="ocd"):
+    """SWD 时钟给多少: --freq > 工程配置 > 按这一代 ST-Link 的最优值(V2 只有 1.8MHz)。"""
+    f = getattr(args, "freq", None) if args else None
+    if f:
+        return int(f)
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    if cfg.get("stlink_freq"):
+        return int(cfg["stlink_freq"])
+    v, _why = _stlink_variant_probe()
+    p = _stlink_profile(v)
+    if p:
+        return int(p["freq_cli"] if channel == "cli" else p["freq_ocd"])
+    return 4000 if channel == "cli" else 1800
+
+
+def _ocd_speed_arg(probe="stlink", args=None):
+    """OpenOCD 的 adapter speed: 按这一代 ST-Link 给最优值(给 V2 要 2000 它也只能 1800)。"""
+    if probe != "stlink":
+        return []
+    return ["-c", "adapter speed %d" % _stlink_freq(args, "ocd")]
+
+
+def _unwrap_cmd(path):
+    """openocd / pyocd 这类工具可能是 .cmd/.bat 包装件: 把里面真正的 exe 抠出来。
+    直接起包装件的话我们拿到的 pid 是 cmd.exe, 杀它会留下真进程当孤儿 —— 孤儿占着探针,
+    ST 官方 CLI 就报 DEV_CONNECT_ERR(真机踩过)。"""
+    if not path or os.name != "nt" or not path.lower().endswith((".cmd", ".bat")):
+        return path
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+    except OSError:
+        return path
+    for m in re.finditer(r'([A-Za-z]:\\[^"\r\n]*?\.exe)', txt):
+        cand = m.group(1).strip()
+        if os.path.isfile(cand):
+            return cand
     return path
 
 
@@ -3922,11 +4375,12 @@ def detect_jlink(verbose=False):
 def detect_stlink(verbose=False):
     """用 STM32_Programmer_CLI -l 列 ST-Link(官方工具只在真 ST-Link 上才认)。"""
     cli = find_stm32_cli()
+    out = ""
     if not cli:
         if verbose:
             print("    [stlink] 没找到 STM32_Programmer_CLI(装 STM32CubeCLT/CubeProgrammer, 或设 STM32_PROGRAMMER_CLI)")
-        return []
-    out = _run_quiet(_argv_for(cli, "-l"), timeout=30)
+    else:
+        out = _run_quiet(_argv_for(cli, "-l"), timeout=30)
     blocks = re.split(r"(?=ST-Link Probe \d+:)", out)
     found = []
     for b in blocks:
@@ -3935,11 +4389,39 @@ def detect_stlink(verbose=False):
         sn = re.search(r"ST-LINK SN\s*:\s*(\S+)", b)
         fw = re.search(r"ST-LINK FW\s*:\s*(\S+)", b)
         bd = re.search(r"Board\s*:\s*([^\r\n]+)", b)
-        found.append({"probe": "stlink", "serial": sn.group(1) if sn else "",
-                      "model": ((fw.group(1) if fw else "") + " " + (bd.group(1).strip() if bd else "")).strip(),
-                      "raw": b})
+        fwv = (fw.group(1).strip() if fw else "")
+        bdv = (bd.group(1).strip() if bd else "")
+        snv = (sn.group(1).strip() if sn else "")
+        # 真机踩到: 探针被别的程序占着时, CLI 的 -l 会吐 "5&1C422B18&0&7" 这种 USB 实例 ID 尾巴当串号,
+        # 照单全收会把垃圾串号塞进 -c 连接串, 之后一律连不上。
+        bad = bool(snv) and not re.fullmatch(r"[0-9A-Fa-f]{12,32}", snv)
+        if bad:
+            snv = ""
+        var, why = _stlink_variant(fwv, bdv, "")
+        found.append({"probe": "stlink", "serial": snv,
+                      "model": (fwv + " " + bdv).strip(),
+                      "fw": fwv, "board": bdv, "variant": var, "variant_why": why,
+                      "cli_bad": bad, "raw": b})
+    if not found:
+        # 官方 CLI 认不出来时(被别的程序占着 / 克隆件 / 没装), 用 OpenOCD 真握一次手: 连得上就说明
+        # 探针确实在, 这是"山寨 ST-Link 也能自动用上"的关键一步。只有真出现"看得见探针"的信号
+        # 才跑 openocd, 免得压根没插探针时白等一秒多。
+        blob = (out or "").lower()
+        signal = (not cli) or ("dev_connect_err" in blob) or ("not a genuine st device" in blob) \
+            or ("unable to connect to st-link" in blob) or ("st-link is not" in blob) \
+            or ("error in initializing st-link" in blob)
+        if signal:
+            ln = _openocd_probe_line(verbose=verbose)
+            if ln:
+                fwm = re.search(r"V(\dJ[A-Za-z0-9]+)", ln)
+                vpm = re.search(r"([0-9A-Fa-f]{4}:[0-9A-Fa-f]{4})", ln)
+                fwv = ("V" + fwm.group(1)) if fwm else ""
+                var, why = _stlink_variant(fwv, "", (vpm.group(1) if vpm else ""))
+                found.append({"probe": "stlink", "serial": "", "model": ln, "fw": fwv,
+                              "board": "", "variant": var, "variant_why": why,
+                              "cli_bad": bool(cli), "via": "openocd", "raw": ln})
     if not found and verbose:
-        m = re.search(r"Error[^\r\n]*", out)
+        m = re.search(r"Error[^\r\n]*", out or "")
         print("    [stlink] 官方 CLI 没认出 ST-Link" + ("(" + m.group(0).strip() + ")" if m else "(可能没插 / 克隆件)"))
     return found
 
@@ -4046,6 +4528,15 @@ def _describe_effective(pid, serial, why):
     d = PROBE_DEFS[pid]
     jset(probe=pid, probe_name=d["name"], serial=serial, probe_source=why)
     print("调试器: %s(%s)" % (d["name"], pid))
+    if pid == "stlink":
+        _v, _vwhy = _stlink_variant_probe()
+        if _v:
+            _p = _stlink_profile(_v)
+            jset(stlink_variant=_v)
+            print("  这一代: %s   (%s)" % (_p["label"], _vwhy))
+            print("  按这代最优: SWD %d kHz(OpenOCD) / %d kHz(官方 CLI)" % (_p["freq_ocd"], _p["freq_cli"]))
+        else:
+            print("  这一代: 没认出来(不猜); 插好探针跑 probe detect 看细节")
     if serial:
         print("  序列号: %s" % serial)
     print("  来源: %s" % why)
@@ -4055,7 +4546,7 @@ def _describe_effective(pid, serial, why):
 def probe_for_work(verbose=False):
     """这条命令该用哪个探针: 已定(参数/环境变量/工程配置)的直接用, 没定就快速探测一次。
     探测顺序 jlink -> stlink -> daplink, 找到第一个就停; 全无返回 ''(交给旧路径报错)。"""
-    global _PROBE, _SERIAL
+    global _PROBE, _SERIAL, _PROBE_WARNED
     if _PROBE:
         return _PROBE
     for pid in ("jlink", "stlink", "daplink"):
@@ -4067,6 +4558,11 @@ def probe_for_work(verbose=False):
             if verbose:
                 print("自动选中调试器: %s(%s)" % (PROBE_DEFS[pid]["name"], pid))
             return pid
+    # 一个都没认出来: 说清楚, 别让后面按老路试 J-Link 的报错把方向带偏
+    # (真机踩到: 假 CLI/克隆件下 ST-Link 认不出来 -> 一路走到 J-Link, 报"检查 J-Link 连接/供电")
+    if not _PROBE_WARNED:
+        _PROBE_WARNED = True
+        print("提示: 没探测到任何调试器 -> 下面按老路试 J-Link; 插着探针却没认出来就看 probe detect, 或 probe use <jlink|stlink|daplink> 指定。")
     return ""
 
 
@@ -4933,7 +5429,7 @@ def cmd_setup(args):
                 problems.append("%s 的 %s 没装" % (PROBE_DEFS[pid]["name"], label))
         print("  最强用法: %s" % PROBE_DEFS[pid]["best"])
         if fix and not cfg.get("probe"):
-            p = save_config({"probe": pid, **({"serial": serial} if serial else {})})
+            p = merge_config({"probe": pid, **({"serial": serial} if serial else {})})
             print("  已写进工程配置: %s(以后不用再指定)" % p)
 
     print("")
@@ -5118,8 +5614,26 @@ def cmd_probe(args):
                 for h in hits:
                     extra = (" S/N=%s" % h["serial"]) if h.get("serial") else ""
                     print("  [找到] %s: %s%s" % (pid, h.get("model") or PROBE_DEFS[pid]["name"], extra))
+                    if pid == "stlink":
+                        if h.get("variant"):
+                            _p = _stlink_profile(h["variant"])
+                            print("        这一代: %s" % _p["label"])
+                            print("        按这代最优: SWD %d kHz(OpenOCD) / %d kHz(官方 CLI)" %
+                                  (_p["freq_ocd"], _p["freq_cli"]))
+                        if h.get("cli_bad"):
+                            print("        注意: 官方 CLI 读不到这只的串号(多半被别的程序占着) -> 烧录/校验会自动改走 OpenOCD")
             else:
                 print("  [没找到] %s" % PROBE_DEFS[pid]["name"])
+        if not found.get("stlink"):
+            _line = _openocd_probe_line(verbose=verbose)
+            if _line:
+                _v, _vw = _stlink_variant("", "", _line)
+                total += 1
+                print("  [OpenOCD 看到] %s" % _line)
+                if _v:
+                    print("        这一代: %s" % _stlink_profile(_v)["label"])
+                    print("        按这代最优: SWD %d kHz(OpenOCD) / %d kHz(官方 CLI)" %
+                          (_stlink_profile(_v)["freq_ocd"], _stlink_profile(_v)["freq_cli"]))
         for h in _pnp_extra:
             print("  [USB 上看到] %s" % h["model"])
         _detail = _buf.getvalue().strip()
@@ -5134,7 +5648,7 @@ def cmd_probe(args):
             print("  1) USB 插好了吗, 换个口 / 换根线(只能充电的线不行)")
             print("  2) 驱动装了吗: J-Link->SEGGER 驱动; ST-Link->STM32CubeCLT/CubeProgrammer; DAPLink->免驱")
             print("  3) 别的程序是不是占着它(比如 IDE、另一个 gdb server、ST 的 stlinkserver)")
-            print("  4) 克隆 ST-Link 会被官方 CLI 拒(报 not a genuine ST device), 这种只能走 OpenOCD")
+            print("  4) 克隆 ST-Link 会被官方 CLI 拒(报 not a genuine ST device): 技能会自动改走 OpenOCD, 不用你管")
             return 1
         return None
 
@@ -5177,14 +5691,26 @@ def cmd_probe(args):
     if not target:
         raise SkillError("用法: probe info <jlink|stlink|daplink>")
     d = PROBE_DEFS[target]
-    jset(probe=target, caps=d["caps"])
+    var = ""
+    if target == "stlink":
+        var, vwhy = _stlink_variant_probe(deep=verbose)
+    caps = _caps_of(target, var)
+    jset(probe=target, caps=caps, stlink_variant=var or None)
     print("探针: %s(%s)" % (d["name"], target))
     print("典型型号: %s" % ", ".join(d["matches"]))
     print("最好的能力: %s" % d["best"])
+    if var:
+        _p = _stlink_profile(var)
+        print("")
+        print("本机插着的这一代: %s   (%s)" % (_p["label"], vwhy))
+        print("  按这代自动选: SWD %d kHz(OpenOCD) / %d kHz(官方 CLI)" % (_p["freq_ocd"], _p["freq_cli"]))
+    elif target == "stlink":
+        print("")
+        print("本机没插着 ST-Link(或官方 CLI 认不出它): 下面按通用能力列, 具体参数等插上后按世代自动选。")
     print("")
     print("能力对照(不同探针各有强弱, 技能按这个选路):")
     for key, label in CAP_LABELS:
-        print("  %-18s %s" % (label, d["caps"].get(key, "")))
+        print("  %-18s %s" % (label, caps.get(key, "")))
     print("")
     print("本机工具:")
     for label, path, hint in _probe_tool_status(target):
@@ -5196,6 +5722,10 @@ def cmd_probe(args):
     print("注意事项:")
     for n in d["notes"]:
         print("  - %s" % n)
+    if var:
+        print("这一代(%s)额外注意:" % var)
+        for n in _stlink_profile(var).get("notes", []):
+            print("  - %s" % n)
     print("")
     print("没有它时怎么替代: %s" % d["degrade"])
     return None
@@ -5285,10 +5815,10 @@ def build_parser():
     s = sub.add_parser("attach"); add_common(s); s.set_defaults(func=cmd_attach)
     s = sub.add_parser("start"); add_common(s); s.set_defaults(func=cmd_start)
     s = sub.add_parser("stop"); add_common(s); s.set_defaults(func=cmd_stop)
-    s = sub.add_parser("verify"); add_common(s)
+    s = sub.add_parser("verify"); add_common(s); add_stlink_args(s)
     s.set_defaults(func=cmd_verify)
 
-    s = sub.add_parser("reset"); add_common(s)
+    s = sub.add_parser("reset"); add_common(s); add_stlink_args(s)
     s.add_argument("--dry-run", action="store_true", dest="dry_run", help="只打印将执行的复位命令")
     s.set_defaults(func=cmd_reset)
 
@@ -5337,7 +5867,7 @@ def build_parser():
     s.add_argument("--keep-halted", action="store_true")
     s.set_defaults(func=cmd_svd)
 
-    s = sub.add_parser("flash"); add_common(s); s.add_argument("--hex", default=None)
+    s = sub.add_parser("flash"); add_common(s); add_stlink_args(s); s.add_argument("--hex", default=None)
     s.add_argument("--dry-run", action="store_true", dest="dry_run",
                    help="只打印将要执行的烧录命令, 不碰板子(第一次烧接电机的板子时先看这个)")
     s.add_argument("--ur", action="store_true", help="ST-Link 专用: 用 mode=UR(under reset) 连接, 板子跑飞/被保护时用")

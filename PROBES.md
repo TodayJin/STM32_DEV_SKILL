@@ -49,20 +49,31 @@ JLinkRTTClient（RTT 回灌）、JLinkRemoteServer、J-Flash。
 
 **没有它时**：RTT 实时性降级 → 用串口探针帧（`serial`）或 OpenOCD RTT；其余能力别的探针都有替代。
 
-## 3. ST-Link V3（V3SET / V3MINI / V3MINIE）
+## 3. ST-Link（V2 独立型 / V2-1 板载 / V3SET / V3MINI / V3MINIE）
 
 **能用的工具**：STM32_Programmer_CLI（烧录/校验/读回/选项字节/救砖/-hf）、ST-LINK_gdbserver（GDB 服务，
 带 SWO 时钟分频与 semihosting）、STM32CubeProgrammer 图形界面（**技能不用它：GUI 拿不到返回码**）、
 OpenOCD（技能用它当 GDB 服务与 RTT 通道）。
 
+**三代差别（技能自动认，不用你选）**：SWD 时钟按代取（V2 = 1800 kHz OpenOCD / 4000 kHz 官方 CLI；V3 = 4000 / 8000，最高 24 MHz）；
+虚拟串口 V3 与板载 V2-1 有、独立 V2 没有；官方 CLI 对克隆件挑剔，认不出就自动改走 OpenOCD（并记住这只探针）。
+`probe info stlink` 会按当前世代列能力表，`doctor` 会打印「按这代最优: SWD … kHz」。
+
 **最强用法**
-- 烧录校验一条命令：`STM32_Programmer_CLI -c "port=SWD freq=8000" -w <hex> -v -rst`（有返回码，好判）。
+- 烧录校验一条命令：`STM32_Programmer_CLI -c "port=SWD freq=8000" -w <hex> -v -rst`（有返回码，好判；`freq` 技能按世代给，V2 是 4000）。
 - 救砖：`mode=UR`（复位下连接）+ `-rdu`（解读保护，会全片擦除）。
 - 现场诊断：`-hf` 官方 HardFault 分析、`-regdump`、`-pwr`（看型号支持）。
 - 自带虚拟串口：一根 USB 同时给 SWD 和串口，少一根线就少一类"收不到数据"的坑 —— 直接配 `serial --port <那个 COM>`。
 - 抓 RTT 日志：`rtt --elf build/x.elf --check-seq` —— 技能自动起 OpenOCD 的 `rtt server`（本地 TCP）并收干净，地址解析与丢帧判定和 J-Link 一个用法。
 - 回灌 RTT 下行：`rtt-send "x" --expect pong`（要发的文本是位置参数）—— OpenOCD 的 `rtt server` 双向，不用 pylink；固件里仍要轮询 `SEGGER_RTT_HasKey()`。
 - 取 RTT 源码：`init-rtt --dir .` —— J-Link 安装目录没有就自动从 SEGGER 官方仓库（BSD）取 6 个文件。
+
+**本机实测（2026-10-11，ST-Link/V2 独立型 S/N 37FF71064E5734368D591143 FW V2J46S7 + STM32G431CBT6）**
+- `flash` 两条路都通：官方 CLI（`Download verified successfully` + `MCU Reset`）与 `--via openocd`（`Programming Finished` / `Verified OK` / `Resetting Target`）。
+- 读回校验两条都通：CLI `-u 0x08000000 0xAA1C`；OpenOCD `dump_image` = 43548 字节 / 0.40 s（≈105 KiB/s）。
+- V2 上请求 2000 kHz 会被硬件降到 1800 kHz（`Unable to match requested speed 2000 kHz, using 1800 kHz`）—— 所以技能直接按 1800 给。
+- `rtt-send` 往返 **108~110 ms**（J-Link 同动作 3~10 ms）：OpenOCD 是轮询读 RAM，慢 1~2 个数量级，实时性要求高的场合用串口自报帧。
+- 残留的 openocd 占着探针时，官方 CLI 报 `ST-LINK error (DEV_CONNECT_ERR)`，且 `-l` 会退化成假串号（实测 `5&1C422B18&0&7`）—— 所以技能跑 CLI 前先清残留 openocd，并对串号做合法性校验。
 
 **注意事项**
 - 机器上同时装了两个 `stlinkserver`（CubeCLT 里的 + 单独装的）会抢设备，只留一个。

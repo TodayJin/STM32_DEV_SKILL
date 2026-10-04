@@ -90,6 +90,9 @@ rtt-send blackbox init-rtt init-fault cleanup  selftest build-verify
 
 ## 版本
 
+**3.17.3**（2026-10-11）—— **ST-Link 真机全链路跑通**（ST-Link/V2 实机）：认出世代并按代给时钟，
+`flash` / `verify` / `reset` / `rtt` / `rtt-send` 在官方 CLI 与 OpenOCD 两条路上全部真机验过；
+官方 CLI 用不了时自动改走 OpenOCD 并记住这只探针；新增 `--via auto|cli|openocd` 与 `--freq`。
 **3.17.0**（2026-10-11）—— **调试器通用化**：J-Link / ST-Link(V3) / DAPLink 插哪个用哪个。
 新增 `probe`（认探针 + 能力矩阵 + 注意事项）、`setup`（按探针体检，`--fix` 用 pip 补、
 `--install` 装系统工具，并主动列出这个探针还能干什么）、`new`（空目录一键出可编译 Makefile 工程）、
