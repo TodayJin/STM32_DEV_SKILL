@@ -1,5 +1,18 @@
 # Changelog — stm32-dev 技能
 
+## 3.17.2 (2026-10-11) —— 真机全链路跑通 + preflight 故障处理器判定分级
+
+**真机验证（J-Link PLUS + STM32G431CBT6，interface-adapter 工程）**
+- 一条链全绿：`flash`（O.K. + 刷后逐字节校验一致）→ `verify`（独立再校一次 OK）→ `read`（变量在涨 = 板子在跑）→ `rtt`（79 行，`--check-seq` 无丢帧）→ `blackbox`（magic 校验通过，能解码）→ `rtt-send "x" --expect pong --repeat 20`（20/20 命中，往返 3~10 ms）。
+- 这是 `rtt-send` 第一次真机验证（J-Link 那条 pylink 直连 DLL 的路）。顺带证伪了一个老误区：只要板子跑的就是手上这份 ELF，RTT 用 ELF 符号地址一把就中；地址对不上时才会走 RAM 搜索兜底。
+
+**修：preflight 的故障处理器检查会误报**
+- 现象（本工程真机踩到）：`#if DEBUG_RTT` 里的裸函数 `b hardfault_entry` 与 `#else` 的 `while(1)` 被判成「只有死循环」，`hardfault_entry()` 里的 `fault_report()` 也不认 —— 一个现场记录做得很足的工程被报成 5 条必须处理。
+- 现在按四级判定，同一文件的同名多份定义（`#if/#else` 两版）取最好的一份：**自己记了 > 委派给记录函数 > 该异常没在 SHCSR 里使能（会升级成 HardFault）> 真报警**。只有「真报警」计入必须处理，其余用 `[--]` 提醒并写清原因。
+- 烧录脚本那段多给一条建议：别手写 `.jlink`，直接用本技能的 `flash`（按探针自动选路 + 刷后逐字节校验）。
+- 新增 3 条断言（技能目录 77 条 / 带 ELF 的工程目录 80 条）。
+
+**3.17.1（同一批）**：文档修正 —— `rtt-send` 要发的文本是**位置参数**（`rtt-send "x" --expect pong`），SKILL.md / PROBES.md 原来写成 `--data` 是错的。
 ## 3.17.0 (2026-10-11) —— 调试器通用化：J-Link / ST-Link(V3) / DAPLink 插哪个用哪个
 
 **动机**：用户要求「技能最好能通用……要发挥不同调试器最好的能力……配好之后不需要人操控全自动来」。

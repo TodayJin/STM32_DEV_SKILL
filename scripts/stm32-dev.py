@@ -985,8 +985,17 @@ def _pf_flash_script_issues(text):
     return issues
 
 
-def _pf_iter_fault_handlers(text):
-    """yield (函数名, 函数体) —— 只挑「没有任何现场记录」的故障 handler。"""
+_PF_LOG_RE = (r"(printf|SEGGER_RTT|RTT_|BlackBox|blackbox|g_bb|fault_report|fault_record|"
+              r"record_fault|report_fault|dump_|_dump|BSP_Log|log_printf)")
+
+
+def _pf_body_has_log(body):
+    """函数体里有没有「把现场留下来」的动作(printf / RTT / 黑匣子 / 调故障记录函数)。"""
+    return bool(re.search(_PF_LOG_RE, body))
+
+
+def _pf_fault_handler_defs(text):
+    """yield (函数名, 函数体) —— 所有故障 handler 定义; 同名可能有多份(如 #if/#else 两版)。"""
     pat = r"void\s+(%s)\s*\([^)]*\)\s*\{" % "|".join(_PF_FAULT_NAMES)
     for m in re.finditer(pat, text):
         depth, idx, body = 1, m.end(), []
@@ -998,11 +1007,57 @@ def _pf_iter_fault_handlers(text):
                 depth -= 1
             body.append(ch)
             idx += 1
-        b = "".join(body)
-        has_log = re.search(r"(printf|SEGGER_RTT|RTT_|BlackBox|blackbox|g_bb|"
-                            r"fault_record|record_fault|BSP_Log|log_printf)", b)
-        if not has_log:
-            yield m.group(1), b
+        yield m.group(1), "".join(body)
+
+
+def _pf_func_logged(text):
+    """粗扫函数定义 -> {函数名: 函数体里有没有现场记录}; 只用来判断「委派」的目标。"""
+    out = {}
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\([^;{)]*\)\s*\{", text):
+        name, idx, depth = m.group(1), m.end(), 1
+        while idx < len(text) and depth > 0:
+            ch = text[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            idx += 1
+        if _pf_body_has_log(text[m.end():idx]):
+            out[name] = True
+        out.setdefault(name, False)
+    return out
+
+
+def _pf_iter_fault_handlers(text):
+    """yield (函数名, 函数体) —— 只挑「自己没记录、也没委派出去」的故障 handler。"""
+    for name, body in _pf_fault_handler_defs(text):
+        if not _pf_body_has_log(body) and not re.search(r"\b(?:b|bl)\s+[A-Za-z_]\w*", body):
+            yield name, body
+
+
+def _pf_fault_verdicts(defs, logged_funcs, shcsr_on):
+    """故障处理器判决。defs = [(rel, name, body, has_log)]。
+    同名多份定义(#if/#else)取最好的一份: 自己记了 > 委派给记录函数 > 异常没使能 > 真报警。
+    返回 (hard, soft), 每项 (rel, name, 原因)。"""
+    best = {}
+    for rel, name, body, has_log in defs:
+        m = re.search(r"\b(?:b|bl)\s+([A-Za-z_]\w*)", body)
+        tgt = m.group(1) if m else ""
+        if has_log:
+            rank, why = 3, "handler 自己就把现场留下了"
+        elif tgt and (tgt in logged_funcs
+                      or re.search(r"(fault|dump|report|blackbox|panic|crash)", tgt, re.I)):
+            rank, why = 2, "现场委派给 %s()(按名字判断那边会记, 建议自己确认一次)" % tgt
+        elif not name.startswith("HardFault") and not shcsr_on:
+            rank, why = 1, "该异常没在 SHCSR 里使能 -> 会升级成 HardFault(那边有记录), 一般不用管"
+        else:
+            rank, why = 0, "只有死循环, 没有 printf / RTT / 黑匣子, 也没委派给记录函数"
+        key = (rel, name)
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, why)
+    hard = [(r, n, w) for (r, n), (k, w) in sorted(best.items()) if k == 0]
+    soft = [(r, n, w) for (r, n), (k, w) in sorted(best.items()) if k in (1, 2)]
+    return hard, soft
 
 
 def cmd_preflight(args):
@@ -1016,7 +1071,7 @@ def cmd_preflight(args):
 
     bad = 0
     flash_files, flash_issues = [], []
-    fault_found = []
+    fault_defs, logged_funcs, shcsr_on = [], set(), False
     wdg_files, has_freeze = [], False
     has_noinit, has_bb, has_rtt = False, False, False
     counter_files, diag_files = [], []
@@ -1029,8 +1084,14 @@ def cmd_preflight(args):
                 for ln, seq, why in iss:
                     flash_issues.append((rel, ln, why, " ".join(seq)))
 
-        for name, _body in _pf_iter_fault_handlers(text):
-            fault_found.append((rel, name))
+        for name, body in _pf_fault_handler_defs(text):
+            fault_defs.append((rel, name, body, _pf_body_has_log(body)))
+        for fname, flog in _pf_func_logged(text).items():
+            if flog:
+                logged_funcs.add(fname)
+        if "Drivers/" not in rel.replace("\\", "/") and re.search(
+                r"SCB->SHCSR|SCB_SHCSR_(?:MEM|BUS|USG)FAULTENA", text):
+            shcsr_on = True
 
         if re.search(r"(HAL_IWDG_Init|HAL_WWDG_Init|IWDG->KR|WWDG->CR|\bHAL_IWDG_Refresh)", text):
             wdg_files.append(rel)
@@ -1061,21 +1122,25 @@ def cmd_preflight(args):
         print("       根因: `g`(resume) 之后紧跟着 `exit`, J-Link 会在 MCU 还没真跑起来时")
         print("             关掉调试会话, CPU 停在复位态 -> 对外总线一个字都不回,")
         print("             现象像「烧完板子就死了」。* JLink 自己不会报任何错。")
+        print("       更省事: 别手写 .jlink, 直接用本技能的 flash(按探针自动选路 + 刷后逐字节校验)。")
     else:
         print("  [OK] 未发现 r/g/exit 缺 Sleep 的脚本")
     print("       注意: 除 Makefile 外, CI / 上位机 / IDE 里的 .jlink 也要一起看。")
 
     # ---- 2) 故障处理器 ----
     print("--- 2. 故障处理器有没有现场记录(坑 #32) ---")
-    if fault_found:
+    hard, soft = _pf_fault_verdicts(fault_defs, logged_funcs, shcsr_on)
+    if hard:
         bad += 1
-        for rel, name in fault_found:
-            print("  [!!] %s  %s() 只有死循环, 没有 printf / RTT / 黑匣子" % (rel, name))
+        for rel, name, why in hard:
+            print("  [!!] %s  %s(): %s" % (rel, name, why))
         print("       修法: python3 stm32-dev.py init-fault 生成 .noinit 黑匣子, 在 handler 里")
         print("             记 CFSR/HFSR/PC/LR/SP; 退一步也要 RTT 打一句。")
         print("       为什么: 死循环 = 复现一次、现场全丢, 只能靠猜。")
     else:
         print("  [OK] 未发现「只死循环」的故障处理器")
+    for rel, name, why in soft:
+        print("  [--] %s  %s(): %s" % (rel, name, why))
 
     # ---- 3) 看门狗与调试冻结 ----
     print("--- 3. 看门狗与调试冻结(坑 #59) ---")
@@ -2731,6 +2796,24 @@ def cmd_selftest(args):
         list(_pf_iter_fault_handlers(hf_log)) == [])
     chk("preflight 不管 CubeMX 的 Error_Handler",
         list(_pf_iter_fault_handlers("void Error_Handler(void) {\n while (1) {}\n}\n")) == [])
+
+    # 6b) 故障处理器: 同一文件 #if/#else 两版 + 委派给记录函数 + 没使能的异常, 都不能误报
+    hf_naked = "void HardFault_Handler(void) { __asm volatile ( \"b hardfault_entry\" ); }\n"
+    hf_dead2 = "void HardFault_Handler(void) { while (1) { } }\n"
+    hf_rec = "void hardfault_entry(uint32_t *f) { fault_report(\"HF\", f); }\n"
+    d_hf = [("it.c", n, b, _pf_body_has_log(b)) for n, b in _pf_fault_handler_defs(hf_naked + hf_dead2)]
+    lf = set(n for n, v in _pf_func_logged(hf_rec).items() if v)
+    hard1, soft1 = _pf_fault_verdicts(d_hf, lf, False)
+    chk("preflight: 同文件 #if/#else 两版 HardFault + 委派 -> 只提醒不报警",
+        len(d_hf) == 2 and not hard1 and len(soft1) == 1)
+    hard2, soft2 = _pf_fault_verdicts(
+        [("it.c", "HardFault_Handler", " { while (1) { } }", False),
+         ("it.c", "UsageFault_Handler", " { while (1) { } }", False)], set(), False)
+    chk("preflight: 裸 HardFault 报警 / 没使能的 UsageFault 只提醒",
+        [x[1] for x in hard2] == ["HardFault_Handler"] and [x[1] for x in soft2] == ["UsageFault_Handler"])
+    hard3, soft3 = _pf_fault_verdicts([("it.c", "UsageFault_Handler", " { while (1) { } }", False)], set(), True)
+    chk("preflight: SHCSR 使能了的 UsageFault 也报警",
+        [x[1] for x in hard3] == ["UsageFault_Handler"] and not soft3)
 
     # 8) 型号识别失败必须报错, 不能猜
     class _N:
