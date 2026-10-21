@@ -7,14 +7,14 @@ description: |
   观测手段分层（串口探针帧/RTT 上行/RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查
   （`preflight`：拿技能里的结论把现有工程扫一遍，机械项自动判、判不了的列人工清单）**、
   空项目脚手架（`new`：自动搭 Makefile 工程 + 按调试器配好）、串口观测（`serial`）、27 个命令、
-  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（92 条实战坑）与 PRACTICES.md（工程实践手册：
+  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（94 条实战坑）与 PRACTICES.md（工程实践手册：
   上电时序 / 协议从站 / 控制与标定 / 状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）、
   PROBES.md（三种调试器各自的坑 / 可用工具 / 最强用法 / 降级路径）、SETUP.md（工具链怎么装、装在哪）。
   适用前提：已有 GNU Make/CMake 工程，或用 `new` 现场生成；不负责 Keil/CubeIDE 工程生成
   （那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.17.6
+  version: 3.17.7
   date: "2026-10-11"
 ---
 
@@ -46,7 +46,7 @@ metadata:
 | 🔬 观测手段分层 | 选哪种观测通道 + 通用集成法（RTT/DWT/故障转储/黑匣子） |
 | ①~⑨ 各阶段 | 具体命令（doctor/make/flash/read/rtt/blackbox…） |
 | 📋 案例复盘 | "串口收不到"一整天：错误的排查路径 |
-| 📚 附录 | `OBSERVE.md` 观测手段 / `PITFALLS.md` 92 条坑 / `PRACTICES.md` 工程实践手册（见文末） |
+| 📚 附录 | `OBSERVE.md` 观测手段 / `PITFALLS.md` 94 条坑 / `PRACTICES.md` 工程实践手册（见文末） |
 
 ---
 
@@ -433,7 +433,7 @@ make flash             # 重烧
 | `PROBES.md` | **三种调试器**（J-Link / ST-Link / DAPLink）各自的：能力表、注意事项、能用的工具、最强用法、降级路径 | 换/买调试器、某个命令报"没探针"、想用某个高级功能时 |
 | `SETUP.md` | **工具链怎么装**：CubeCLT / STM32CubeProgrammer / OpenOCD / pyOCD / Cube 固件包 / 驱动 | 新机器、缺工具、探针认不出来时 |
 | `references/h743-hal-bringup.md` | **H743 裸机工程 bring-up**：`new` 内存参数、接 Cube HAL（Makefile/conf/按需模块）、时钟树单独一次改（480MHz 顺序与 PLL 取值）、无时钟⇒SWD 失联与 BOOT0 救砖、不用外设的时钟/时基验收、**假硬件 + RTT 断言自测** | 新工程 bring-up、要先把逻辑跑通、调试口连不上时 |
-| `PITFALLS.md` | **92 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
+| `PITFALLS.md` | **94 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
 | `PRACTICES.md` | **工程实践手册**：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 | **新板 bring-up 前、写协议或标定模块前、收尾前**；想知道"怎么做对"（不是"怎么被坑"）时 |
 
 ### 🔟 十条最高频的坑（内联速查，全文见 PITFALLS.md）
@@ -477,7 +477,7 @@ stm32-dev/
 ├── PROBES.md           (附录: 三种调试器 —— 能力/注意事项/可用工具/最强用法/降级路径)
 ├── SETUP.md            (附录: 工具链怎么装 + 驱动 + 环境变量)
 ├── OBSERVE.md          (附录: 观测手段分层 + 通用集成法)
-├── PITFALLS.md         (附录: 92 条实战坑 + 主题索引)
+├── PITFALLS.md         (附录: 94 条实战坑 + 主题索引)
 ├── PRACTICES.md        (附录: 工程实践手册 —— 上电时序/协议从站/控制与标定/状态灯/台架/上位机/流程/硬件板级)
 ├── CHANGELOG.md        (版本演进)
 └── scripts/
