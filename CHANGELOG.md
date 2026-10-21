@@ -404,3 +404,7 @@ cleanup 默认只报告不动手。
 
 ## 3.19.2 (2026-10-21)
 - PITFALLS #100: H7 以太网链路正常但收发全哑的三连坑 —— nINTSEL strap 未拉低导致无 50MHz REF_CLK（用 TIM 外部计数判定，别用 GPIO 采样）、DMA 缓冲必须放 AXI SRAM、Cube 例程 MSP 用的是 Nucleo 引脚。
+
+## 3.20.0 (2026-10-21)
+- PITFALLS #101: H7 ETH 自管 RX 描述符的 tail pointer 语义、禁止混用 HAL_ETH_ReadData、禁止周期写 DMACRCR、lwIP 轮询不能挂在慢节拍上。
+- PITFALLS #102: J-Link `Failed to initialize DAP` 的三类原因 + 用 PC 值区分 bootloader/应用。

@@ -7,14 +7,14 @@ description: |
   观测手段分层（串口探针帧/RTT 上行/RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查
   （`preflight`：拿技能里的结论把现有工程扫一遍，机械项自动判、判不了的列人工清单）**、
   空项目脚手架（`new`：自动搭 Makefile 工程 + 按调试器配好）、串口观测（`serial`）、27 个命令、
-  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（100 条实战坑）与 PRACTICES.md（工程实践手册：
+  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（102 条实战坑）与 PRACTICES.md（工程实践手册：
   上电时序 / 协议从站 / 控制与标定 / 状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）、
   PROBES.md（三种调试器各自的坑 / 可用工具 / 最强用法 / 降级路径）、SETUP.md（工具链怎么装、装在哪）。
   适用前提：已有 GNU Make/CMake 工程，或用 `new` 现场生成；不负责 Keil/CubeIDE 工程生成
   （那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.20.1
+  version: 3.20.3
   date: "2026-10-21"
 ---
 
@@ -275,8 +275,10 @@ python3 scripts/netlist_pins.py board.tel --net PC4 PC5 PA7  # 反查：这几�
 5. **答案连数字一起落盘**：记「用户目视：正走 0.1155 rad = 钳口张开」，而不是「正=张开」——
    有数字的那条下次才能被验证。**新答案推翻旧答案时显式作废旧的**，并同步改掉所有基于它的文档与结论。
 
-**反向也成立**：能用探针/寄存器测出来的，**不要拿去问用户**（"你觉得电机热不热"毫无意义，读线圈温度就行）。
+**反向也成立**：能用探针/寄存器测出来的，**不要拿去问用户**（"电机热不热"读线圈温度就行）。
 只有人眼、人手才能获得的信息，才值得占用用户的注意力。
+
+**本机能跑的验证就自己跑**：agent 的终端就在用户这台 PC 上 —— `ping`、`arp -a`、`telnet <ip> <port>`、`curl` 直接执行并读数字，不要让用户手动跑再贴输出（慢、易截断、还会把"本机回的不可达"当成回包）。只有焊、量、看、掰这类物理动作才交给用户。
 
 ### 7. 上电、标定、判定：先把「安全默认态」定下来，再谈功能
 有三类**不会报错的静默故障**，根子都在"默认态没定义好"（细节见 PITFALLS #55 / #68 / #69 / #70）：
@@ -291,6 +293,16 @@ python3 scripts/netlist_pins.py board.tel --net PC4 PC5 PA7  # 反查：这几�
 **共同点：出问题时绝不留下一个"看起来正常"的状态** —— 要么明确失败并把它报出来，
 要么保持**上一个已知有效值**。"会漂的常量 / 会失败还照写的 flash / 会冲向 0 的上电"这三样，
 都属于"功能全对、现场出事"。
+
+### 8. 探针必须「自带正例」——报告 0 之前先证明它数得出来
+一个探针报 0，只说明「它在自己的窗口里没看到事件」，不说明硬件没有事件。**每次说"0 次跳变/0 帧"之前，先在同一段代码里制造一个必然发生的事件**：
+- 数引脚边沿 → 同一循环里先翻转一根自己控制的 GPIO，计数必须涨；
+- 判「收不到」→ 同一函数里先发一帧、或开内部回环，再判描述符；**发送和判读必须在同一个函数里**，跨几分钟的"先发一次、稍后采样"基本等于没发（窗口里根本没流量）；
+- 判「时钟没有」→ 这种结论最贵：悬空/高速脚的 GPIO 采样数出来的几千次是噪声，两种计数法（TIM 外部时钟 / 输入捕获）还常常互相矛盾。**没有仪表就不要用软件给时钟下结论**，改用"内部回环分层"这类不依赖时钟测量的判据。
+两次探针结果互相矛盾时，先怀疑探针，再怀疑硬件；把矛盾的探针当证据往下推，会把整轮排查带偏。
+
+### 9. 引脚号一律查手册的引脚表，不凭记忆
+说"某个 strap 在 pin X"之前，翻到手**封装引脚分配表**（如 LAN8720A 的 Table 2-8）逐条对：同一颗芯片不同封装/不同文档版本会把相邻功能对调，差一个脚号就会让用户去焊一个完全不相干的电阻。**建议用户动烙铁之前，把"引脚号 + 手册表号"一起写出来**——这是唯一能自查的成本。
 
 ---
 
@@ -473,10 +485,10 @@ make flash             # 重烧
 | `references/h743-hal-bringup.md` | **H743 裸机工程 bring-up**：`new` 内存参数、接 Cube HAL（Makefile/conf/按需模块）、时钟树单独一次改（480MHz 顺序与 PLL 取值）、无时钟⇒SWD 失联与 BOOT0 救砖、不用外设的时钟/时基验收、**假硬件 + RTT 断言自测** | 新工程 bring-up、要先把逻辑跑通、调试口连不上时 |
 | `references/spi-lcd-bringup.md` | **4 线 SPI 小屏 bring-up**：ST7789P3 原厂初始化表（0xD0 双写、D6=A1、per-byte CS）、ST7789 各子型号差异、1LINE 释放 MISO、分色带/上红下蓝自检、**无 MISO 不能读回显存**、帧长/CS 粒度阶梯与提速下界 | 点一块 SPI TFT、屏幕全黑/花屏/变慢时 |
 | `references/bus-loopback-bringup.md` | **通信口 bring-up**：RS485/CAN 两路对打（接线、DE 与 TC 时序、直流驱动测试、序号+校验判据）、隔离收发器上电测点、**FDCAN 先做内部回环**、**收不到时的寄存器签名**（UART PE/NF/ORE=RX 悬空；FDCAN 消息 RAM 元素数为 0 ⇒ FIFO 长度 0，TEC=0 且 TXFQS 自由槽位 0；FDCANSEL 默认 HSE 的坑；TXFQS/CCCR 等偏移以 CMSIS struct 为准）、以太网“先交换层后协议栈”分层 | 新板第一次验 485/CAN/网口、或“发得出去收不到”时 |
-| `references/h7-eth-lwip-bringup.md` | **H7 以太网 bring-up（RMII PHY → MAC/DMA → lwIP 裸机）**：MDIO 位翻转读 ID/BMSR 与采样偏移、**描述符/缓冲必须放 AXI SRAM（DTCM DMA 访问不到，症状是 SR 自清、RX 恒 0）**、MSP 引脚表按网表重写、`HAL_ETH_Start` 不可漏、**RMII/MII 模式位（`SYSCFG->PMCR.EPIS_SEL`，读 PMCR 注意偏移 0x04）**、广播/混杂过滤（ARP 是广播）、HAL v1.13 的 ReadData/Transmit 接口、静态 IP 与 APIPA 169.254/16、Windows 防火墙不拦入站 ICMP 的误判、**REF_CLK 边沿探针与 PHY 内部回环（BMCR bit14）组成的四步 RX 判据** | 第一次点网口、PHY link 亮但 ping 不通、lwIP 收不到帧时 |
+| `references/h7-eth-lwip-bringup.md` | **H7 以太网 bring-up（RMII PHY → MAC/DMA → lwIP 裸机）**：MDIO 位翻转读 ID/BMSR 与采样偏移、**描述符/缓冲必须放 AXI SRAM（DTCM DMA 访问不到，症状是 SR 自清、RX 恒 0）**、MSP 引脚表按网表重写、`HAL_ETH_Start` 不可漏、**RMII/MII 模式位（`SYSCFG->PMCR.EPIS_SEL`，读 PMCR 注意偏移 0x04）**、广播/混杂过滤（ARP 是广播）、HAL v1.13 的 ReadData/Transmit 接口、静态 IP 与 APIPA 169.254/16、Windows 防火墙不拦入站 ICMP 的误判、**REF_CLK 边沿探针与 PHY 内部回环（BMCR bit14）组成的四步 RX 判据** | 第一次点网口、PHY link 亮但 ping 不通、lwIP 收不到帧时（也含 Windows 三种 ping 回显 / “网络不可达”= 本机无路由，需给网卡加副地址） |
 | `references/small-peripheral-recipes.md` | **小幅外设配方**：有源蜂鸣器（非阻塞单次短鸣）、4 线风扇（25kHz PWM + TACH EXTI + RPM 公式与实测单调性）、背光/EN 上电安全态、TIM 需要的 HAL 模块 | 接蜂鸣器/风扇/背光、或“先测一下这个小器件”时 |
-| `references/h7-flash-and-halt-triage.md` | **烧录路径与“卡死”三分诊断**：烧 bin 不烧 hex（全零字节丢失导致 verify 报个别字节不同）、烧完必须 `r`+`g`、CFSR/时基/`g_boot_stage` 三招区分 HardFault 与 HAL 超时、探针速率怎么定 | 烧完“没生效”、RTT 抓不到、看着像死机时 |
-| `PITFALLS.md` | **100 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
+| `references/h7-flash-and-halt-triage.md` | **含 `Failed to initialize DAP` 分诊**（应用侧判活 → 多档速度 → BOOT0，而不是先怀疑固件） | **烧录路径与“卡死”三分诊断**：烧 bin 不烧 hex（全零字节丢失导致 verify 报个别字节不同）、烧完必须 `r`+`g`、CFSR/时基/`g_boot_stage` 三招区分 HardFault 与 HAL 超时、探针速率怎么定 | 烧完“没生效”、RTT 抓不到、看着像死机、SWD 连不上时 |
+| `PITFALLS.md` | **102 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
 | `PRACTICES.md` | **工程实践手册**：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 | **新板 bring-up 前、写协议或标定模块前、收尾前**；想知道"怎么做对"（不是"怎么被坑"）时 |
 
 ### 🔟 十条最高频的坑（内联速查，全文见 PITFALLS.md）

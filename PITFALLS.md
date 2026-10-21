@@ -808,3 +808,14 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
   3) **Cube 例程的 `HAL_ETH_MspInit` 是 Nucleo 板引脚**（含 PG2/PG11/PG13），换板后必须按自己网表改，否则 TX_EN/TXD0 这些脚根本没配成 AF11 —— 少两根线就全哑。
   另：`SYSCFG->PMCR.EPIS_SEL`（bit23）= RMII、=0 是 MII；H7 上 HAL 有时不生效，建议显式写一次；注意 PMCR 偏移是 **0x04**（读 0x00 会一直读到 0，误判成 MII）。
 - 相关：#97（FDCAN 消息 RAM）、#99（串口 TX/RX 接反）。
+
+### 101. H7 以太网 RX 自管描述符：tail pointer、HAL 混用、轮询节拍三个必踩点
+- **tail pointer 语义（DWC/GMAC）**：`DMACRDTPR` 指向"最后一个已交给 DMA 的描述符"。初始化时必须**先把整圈描述符都写好 DESC0/DESC3(OWN|BUF1V)，最后只推一次 tail**；如果边挂边推，DMA 会在中途开始取，造成 desc0 空、desc1/2 有帧的错位环，表现为"描述符里明明有帧，但你的索引永远读到 OWN=1 的那个"。
+- **绝对不要混用 `HAL_ETH_ReadData` 和自管描述符**：HAL 走零拷贝池（`ETH_UpdateDescriptor` 会用池里的 pbuf 重挂 DESC0/BackupAddr0 并改写 `RxBuildDescIdx`），一次调用就能把你的自管缓冲和索引全部打乱。自管就全程自管，HAL 那条路一个函数都别调。
+- **不要周期性写 `DMACRCR`**：`ETH->DMACRCR = ...RX_START...` 是"启动接收"，每秒写一次等于每秒把 RX DMA 复位，描述符环被推回原点，RX 计数长期为 0。
+- **lwIP 轮询必须每圈跑**：把 `lwip_port_poll()` 放在"每 500ms 一次的 UI/上报节拍"里，往返延迟就等于 500ms、吞吐掉到 1~2KB/s。凡是慢屏刷（如软件 SPI 刷 240×320）也必须和 poll 解耦，否则刷屏期间网络完全停摆。
+- 判定顺序建议：先 `MACCR.LM=1` 自环（验 MAC+DMA，不碰引脚）→ 再 PHY 回环（验 RMII 六根线）→ 最后上 lwIP。PHY 回环能收到帧但 lwIP 收不到，问题一定在软件描述符/轮询，不在硬件。
+
+### 102. J-Link 报 `Failed to initialize DAP` 但芯片其实在跑
+- 三种情况按概率排：① SWD 排线插偏一格 / 排针那头线断（板子侧量通断量不出来，要从探头排针量到 MCU 脚）；② 目标板没供电或缺 VTref；③ MCU 被 BOOT0 或复位按在特殊启动态。
+- 判据：`Connect` 报 DAP 失败后，用 `regs` 读 PC —— 落在 `0x1FF0_xxxx` 说明停在系统 bootloader（BOOT0=1 没跳回），落在 `0x0800_xxxx` 才是应用在跑。别把"bootloader 在跑"误判成"固件崩了"。

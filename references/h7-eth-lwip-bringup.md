@@ -21,6 +21,15 @@ PHY(MDIO) → MAC/DMA → 交换机/对端 → 协议栈(ARP/ICMP/TCP)
   - BMCR（reg 0）默认 `0x3100`
 - BMSR 是 latching 的，**连读两次**才拿到稳定值。
 
+### 1.1 RMII 的 50MHz REF_CLK 来自 PHY，而 PHY 要不要输出它由 strap 决定
+
+- **先对引脚表**（LAN8720A/LAN8720Ai，24-QFN，手册 Table 2-8）：`pin1 = VDD2A`、**`pin2 = LED2/nINTSEL`**、**`pin3 = LED1/REGOFF`**、`pin13 = MDC`、**`pin14 = nINT/REFCLKO`**、`pin15 = nRST`、`pin16 = TXEN`、`pin17 = TXD0`、`pin18 = TXD1`、`pin7 = RXD1/MODE1`、`pin8 = RXD0/MODE0`。**相邻两脚就是两个不同 strap，凭记忆说错一个脚号会让用户去焊一个完全不相干的电阻。**
+- `nINT/REFCLKO`（pin14）当 `nINTSEL` strap **拉到 VSS** 时输出 **50MHz REFCLKO**；悬空或上拉 = nINT 中断模式（默认），此时**引脚上没有时钟**。
+- `nINTSEL` 是 **pin2（LED2 脚）** 的复用功能：裸片内部有上拉，所以 pin2 必须有**明确的 10k 级下拉到 GND**。这一脚不要靠「串电阻 + LED 到地」来拉低——LED 的正向压降（≈1.8V）让这条路径在采样时拉不低。**判据是 pin2 电压（刚上电瞬间 <0.2V），不是"灯闪不闪"**：REFCLKO 模式下 LED2 照常做 100M 指示，灯闪反证不了任何东西。
+- `pin3 = LED1/REGOFF` 是另一个 strap：REGOFF 拉低 = 用片内稳压器给 VDDCR 供电（本类板子几乎都这么接）。往 pin3 上加下拉只影响 REGOFF，**不会让 pin14 出时钟**——把 1k 加在这里是白改一轮。
+- **strap 在上电（POR）和 `nRST` 上升沿采样**：只按 J-Link 复位不一定够，稳妥做法是断电重上电。
+- 这条链路是静默的：PHY 的 ID/BMSR/link 全部正常（那是 PHY↔对端 PHY 的事），MDIO 也照常可读，但 MAC 没有 TX/RX 时钟 → **一帧都收不到、`HAL_ETH_Transmit` 仍返回 HAL_OK**。
+
 这一层过了，才说明“PHY 供电、晶振、RMII 参考时钟（PHY 的 REFCLKO 送 MCU）、MDIO 走线”都没问题。
 
 ---
@@ -93,10 +102,64 @@ MODIFY_REG(SYSCFG->PMCR, SYSCFG_PMCR_EPIS_SEL, SYSCFG_ETH_RMII);   /* EPIS_SEL[2
 
 ## 3. 收发两侧的判据（先分开，再合起来）
 
+### 3.1 先用回环把“谁的锅”分清楚（顺序：MAC 回环 → PHY 回环 → 数 RX 引脚）
+
+1. **MAC 内部回环**（`SET_BIT(ETH->MACCR, ETH_MACCR_LM)`，发一帧后 `CLEAR_BIT`）：**绕开 PHY、绕开 RMII 引脚**。
+   - 收到（描述符 `OWN=0` 且 `PL>0`）→ **MAC + DMA 接收没问题**，别再去改 DMA/描述符/缓存配置；
+   - 收不到 → 才回去查 2.1~2.5。
+2. **PHY 内部回环**（MDIO 写 BMCR `|= 0x4000`，回读 `0x7100` 确认）：测 PHY→MAC 的 RMII 接收段。
+   **必须在同一个函数里：开回环 → 当场连发 10 帧 → 立刻轮询描述符**。分两处做（先开回环、过一会儿再采样）会得到"0 帧"的假阴性——那个 300ms 窗口里可能一帧都没发出去。
+3. **直接数 RX 三根脚**（PC4/PC5/PA7 临时改 GPIO 输入 + 下拉，采样 200~300ms 数跳变，探完恢复 `GPIO_AF11_ETH`）：
+   **采样循环里必须同时在发包**（AF 输入脚的 `IDR` 仍然反映引脚电平，不用改配置就能边发边读），否则测的是"没流量时的静默"。
+   - 有跳变 → 信号到了 MCU，问题在 MAC 配置；
+   - **恒 0**（且同窗口内确认发出去了 ≥10 帧）→ PHY 没在驱动 RXD0/RXD1/CRS_DV（回环模式下也一样）→ 剩下的只能是这几根线的通断或 PHY 本身；此时**停手**，让用户打 U21 pin7/8/11 ↔ PC5/PC4/PA7 通断、pin16/17/18 ↔ PB11/PB12/PB13 通断。
+   - **实测结论：先补焊，再换芯片。** 本类板子出现过"MAC 回环收到 / PHY 回环 0 帧 / RX 三脚恒 0"，用户在 0.5mm 间距 QFN 上把 RMII 六脚补焊后，**同一份固件立刻恢复**（描述符命中 0 → 93）。手工焊的 QFN "看着有锡" 完全可能是虚焊；换 PHY 是最后一步，不是第一步。
+
+> 三步的价值在于每一步都能**单独排除一层**，且结论是二值的。混在一起改配置，永远说不清是代码还是硬件。
+
+### 3.2 软件测 REF_CLK 频率不可靠，别用它下结论
+
+- 把 REF_CLK 脚当 GPIO 数 `IDR` 跳变的办法**会读到噪声**（悬空/高速脚都能数出几千次），既不能证明有 50MHz，也不能证明没有。
+- 行级计数（TIM 外部时钟模式）与输入捕获两种写法在本类板子上出现过**互相矛盾**的结果（一个 0、一个显示捕获在变）。出现这种矛盾时，**先认定两个探针都不可信**，不要挑其中一个当结论——这一轮排查里正是靠这条挑错，先"确诊"了一个并不存在的 strap 故障，让用户白焊了一颗电阻。
+- 结论：**时钟有无不要用软件数**。判断交给 3.1 的回环分层；真要测频率就用逻辑分析仪/示波器。
+- ⚠️ `PITFALLS.md` 第 100 条里"用 TIMx 外部时钟模式数 PA1 边沿、100ms 应约 5,000,000"那句**判据不可用**（实测给过 0，而输入捕获同时在变）；以本节为准，遇到矛盾时不要择一采信。
+
+### 3.3 帧进了描述符、HAL 却交不出来
+
+现象：轮询 `RxDesc[i]->DESC3` 有 `OWN=0` 且 `PL>0`（回环/对端确实来帧了），`HAL_ETH_ReadData()` 却恒失败（`app==NULL`），收帧计数一直 0。
+这说明**硬件侧已经收到**，问题在 HAL 的描述符簿记（`RxBuildDescIdx/RxBuildDescCnt` + 尾指针）或零拷贝缓冲供应（`HAL_ETH_RxAllocateCallback` 拿不到缓冲就整环停摆）。
+
+兜底：自己走环，完全不经过 HAL 的取帧状态机。
+
+```c
+/* 缓冲放 .eth_dma（AXI），每个描述符一条 */
+static uint8_t rxbuf[ETH_RX_DESC_CNT][ETH_RX_BUFFER_SIZE] __attribute__((aligned(32), section(".eth_dma")));
+
+void eth_rx_rearm(uint32_t i) {
+  ETH_DMADescTypeDef *d = (ETH_DMADescTypeDef *)EthHandle.RxDescList.RxDesc[i];
+  d->DESC0 = (uint32_t)rxbuf[i]; d->DESC1 = 0; d->DESC2 = 0; __DMB();
+  d->DESC3 = ETH_DMARXNDESCRF_OWN | ETH_DMARXNDESCRF_BUF1V;   /* BUF1V = 0x0100_0000 */
+}
+void eth_rx_setup(void) {                    /* HAL_ETH_Start() 之后调一次 */
+  for (uint32_t i = 0; i < ETH_RX_DESC_CNT; i++) eth_rx_rearm(i);
+  __DMB();
+  ETH->DMACRDTPR = (uint32_t)&DMARxDscrTab[ETH_RX_DESC_CNT - 1];   /* H7 用尾指针, 没有 RCH 环尾位 */
+}
+```
+
+取帧：判 `DESC3 & OWN` → `len = DESC3 & 0x3FFF` → `pbuf_take` 拷出 → 重挂该条并把 `DMACRDTPR` 指向它。
+
+- 错误位是**写回格式**的名字：`ETH_DMARXNDESCWBF_CE / _RWT / _OE`（写 `ETH_DMARXNDESCRF_CE` 编译直接报不存在）；`BUF1V` 是 `0x0100_0000`。
+- **不要每秒重写 `DMACRCR.SR` 当"强启动"**：会搅乱尾指针与 DMA 状态机、把真实状态盖掉（本轮排查里就把现场弄浑过一次）。
+- 这条路在本项目里编译过、跑过启动流程，但最后一环（PC ping 通）因 SWD 失联未闭环；**用之前先跑 3.1 的回环测试确认帧进了描述符**，再对比 HAL 路径与自管路径的计数。
+
+### 3.4 其它判据
+
 - **收**：在 `ethernetif_input()` 里给“进栈的帧”加计数。**PC 主动 ping 时才会涨**，别指望“等一会儿就有广播”。
 - **发**：开机后每秒 `etharp_gratuitous(&gnetif)` 发 20 次；在 PC 上 `arp -a` 找板子 IP 对应的 `02-00-00-00-00-01`：
   - 有 → 板子→PC 通，问题只剩收包；
   - 没有 → 板子帧出不去（PHY/RMII/交换机）。
+  - 注意：`HAL_ETH_Transmit` 返回 `HAL_OK` **只代表描述符排进队列**，不代表线上真的发出去了——必须用 `arp -a` 或回环来验。
 - **描述符现场**：RX 描述符 `DESC3` 的 `OWN`（bit31）与 `BUF1V`（**0x0100_0000**，不是 0x4000_0000）都要为 1；`DESC0` 应指向 AXI SRAM。
 - **RX 帧长度**在 `heth.RxDescList.RxDataLength`（HAL v1.13 的 `HAL_ETH_ReadData(&heth,&app)` 只回指针，不回长度）。
 
@@ -120,7 +183,18 @@ Cube 包里自带完整模板：`Projects/<board>/Applications/LwIP/LwIP_TCP_Ech
 
 ## 5. 现场/网络侧：别把别人的问题算到板子上
 
-- **Windows 防火墙默认拦入站 ICMP**：PC↔PC ping 不通**不能**证明交换机坏。判二层看 `arp -a` 有没有学到对端 MAC。
+- **Windows 防火墙默认拦入站 ICMP**：PC↔PC ping 不通**不能**证明交换机坏。判二层看 `arp -a` 有没有学到对端 MAC（要测 ping 就在目标机以管理员加放行规则：`netsh advfirewall firewall add rule name="ICMP" protocol=icmpv4:8,any dir=in action=allow`）。
+- **看懂 Windows ping 的回显**：`来自 <本机IP> 的回复: 无法访问目标主机` 是**本机自己的 ARP 失败**，统计里的“已接收 N”是这些本地错误回显，**不是板子的回包**。真回包长这样：`来自 <板子IP> 的回复: 字节=32 时间<1ms TTL=...`。用这个区分“没通”与“通了”。
+- **三种失败回显对应三种完全不同的问题，先分清再动手**：
+  - `来自 <本机IP> 的回复: 无法访问目标主机` → 同网段、本机 ARP 解析失败，包没出去；
+  - `请求超时` → 包发出去了，没人回（对端没收到或没应答）；
+  - `PING: 传输失败。常见故障` / `Network is unreachable` → **本机根本没有到该网段的路由，连 ARP 请求都没发**。
+- **`arp -a` 里有板子的 MAC 只能证明板子→PC 方向通**：那是板子发免费 ARP 时学会的，即使本机没有到它的路由也会留下条目。要证明“能通信”必须实际打通一次（ping 回显来自板子 IP，或 TCP 端口连上）。
+- **接板子那块网卡的地址先对一遍**：它常常不是 169.254/16（接上办公网时 DHCP 会拿到 192.168.x/24，此时 ping 报“网络不可达”）。测之前给它加一个同网段副地址（**要管理员**，agent 的终端没有提升权限，这条命令交给用户跑）：
+  ```
+  netsh interface ipv4 add address name="以太网" address=169.254.208.195 mask=255.255.0.0
+  ```
+  用 `/dev/tcp/<ip>/<port>` 或 `curl` 验证时同样受这条路由约束——没路由时报的是 `Network is unreachable`，不是板子的问题。
 - 交换机是独立芯片时：先确认“两台 PC 经这块板交换机能 ARP 互见”，再查 MCU 那个口。
 - `ipconfig` 里 `192.168.x` 常常是 WLAN 网卡，**真正插板子的那块网卡**才是要看的那个（APIPA 段）。
 
@@ -133,10 +207,8 @@ Cube 包里自带完整模板：`Projects/<board>/Applications/LwIP/LwIP_TCP_Ech
 3. 读 `MACPFR`（本板实测 bring-up 时 `0x618`）与 `RxDescList.RxDataLength`。
 4. `g_eth_rx_frames` 在 PC ping 后是否增长：不涨 = 收不到；涨但 ping 不通 = 回包/校验。
 5. 免费 ARP + PC `arp -a` 判发送方向。
-6. **REF_CLK 在不在**（不用示波器）：把 PHY 送 MCU 的那根参考时钟脚临时配成 GPIO 输入，紧循环里数 `IDR` 跳变，5 ms 内**几千次以上**就说明时钟在（50MHz 会严重混叠，只要远大于 0 即可）；探完**必须恢复成 `GPIO_AF11_ETH`**，否则后面 ETH 也没时钟。
-7. **PHY 内部回环**绕开交换机与网线：MDIO 写 BMCR `|= 0x4000`，回读应为 `0x7100`（确认写进去），再让 MAC 发一帧（`etharp_gratuitous` 就够）。
-   - 收到 → MAC↔PHY 的 RX 通路正常，问题在交换机/线缆/对端口；
-   - 仍收不到 → 问题在 **RXD0 / RXD1 / CRS_DV 三根接收线**或 PHY 自身。
+6. **不要用软件数 REF_CLK 的边沿来判定时钟**（见 3.2）：GPIO 采样会读到噪声，行级计数与输入捕获还可能互相矛盾——两个探针打架时两个都不算证据。
+7. **MAC 内部回环**（`MACCR.LM`）先确认 MAC+DMA 收得对；再用 **PHY 内部回环**（BMCR `|= 0x4000`，回读 `0x7100`，**开回环与发帧放在同一函数**）确认 PHY→MAC；最后**把 PC4/PC5/PA7 当 GPIO 数跳变（采样期间持续发包）**确认 PHY 到底有没有驱动接收线。
 8. 到第 7 步还没通就**停手**：上逻辑分析仪看 RXD0/RXD1/CRS_DV 有没有波形，再配合万用表打“PHY 侧 → MCU 侧”通断。**这一步之后不要再改固件** —— 继续调配置只会把已经验证过的部分弄坏，且每一轮都要重新回答所有问题。
 
 > 分层原则：**“配置对不对”靠寄存器，“线通不通”靠波形/通断**。两类证据混在一起调，结论永远是浑的。
