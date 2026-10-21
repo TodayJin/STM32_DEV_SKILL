@@ -398,3 +398,6 @@ cleanup 默认只报告不动手。
 ## 3.19.0 (2026-10-21)
 - PITFALLS #97: H7 FDCAN 必须配置消息 RAM 元素数量(RxFifo0ElmtsNbr/TxFifoQueueElmtsNbr...)，否则 FIFO 为 0、一帧都发不出；附内部回环先验法。
 - PITFALLS #98: RS-485 半双工自测——先清 PE/FE/NE/ORE(H7 是 NECF) 再用寄存器级接收；DE 要一次性拉高走流式收发，逐帧切 DE 必挂；附 GPIO 采样 RX 判"信号是否到 MCU"。
+
+## 3.19.1 (2026-10-21)
+- PITFALLS #99: 串口全哑先查 TX/RX 是否画反(如 PE0=UART8_RX / PE1=UART8_TX)，用 USART CR2.SWAP 在固件里救回，附"初始化后读 CR2 bit15 验证"的检查点。

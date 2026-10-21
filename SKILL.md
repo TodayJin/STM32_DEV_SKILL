@@ -7,7 +7,7 @@ description: |
   观测手段分层（串口探针帧/RTT 上行/RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查
   （`preflight`：拿技能里的结论把现有工程扫一遍，机械项自动判、判不了的列人工清单）**、
   空项目脚手架（`new`：自动搭 Makefile 工程 + 按调试器配好）、串口观测（`serial`）、27 个命令、
-  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（98 条实战坑）与 PRACTICES.md（工程实践手册：
+  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（99 条实战坑）与 PRACTICES.md（工程实践手册：
   上电时序 / 协议从站 / 控制与标定 / 状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）、
   PROBES.md（三种调试器各自的坑 / 可用工具 / 最强用法 / 降级路径）、SETUP.md（工具链怎么装、装在哪）。
   适用前提：已有 GNU Make/CMake 工程，或用 `new` 现场生成；不负责 Keil/CubeIDE 工程生成
@@ -464,7 +464,7 @@ make flash             # 重烧
 | `references/bus-loopback-bringup.md` | **通信口 bring-up**：RS485/CAN 两路对打（接线、DE 与 TC 时序、直流驱动测试、序号+校验判据）、隔离收发器上电测点、**FDCAN 先做内部回环**、**收不到时的寄存器签名**（UART PE/NF/ORE=RX 悬空；FDCAN 消息 RAM 元素数为 0 ⇒ FIFO 长度 0，TEC=0 且 TXFQS 自由槽位 0；FDCANSEL 默认 HSE 的坑；TXFQS/CCCR 等偏移以 CMSIS struct 为准）、以太网“先交换层后协议栈”分层 | 新板第一次验 485/CAN/网口、或“发得出去收不到”时 |
 | `references/small-peripheral-recipes.md` | **小幅外设配方**：有源蜂鸣器（非阻塞单次短鸣）、4 线风扇（25kHz PWM + TACH EXTI + RPM 公式与实测单调性）、背光/EN 上电安全态、TIM 需要的 HAL 模块 | 接蜂鸣器/风扇/背光、或“先测一下这个小器件”时 |
 | `references/h7-flash-and-halt-triage.md` | **烧录路径与“卡死”三分诊断**：烧 bin 不烧 hex（全零字节丢失导致 verify 报个别字节不同）、烧完必须 `r`+`g`、CFSR/时基/`g_boot_stage` 三招区分 HardFault 与 HAL 超时、探针速率怎么定 | 烧完“没生效”、RTT 抓不到、看着像死机时 |
-| `PITFALLS.md` | **98 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
+| `PITFALLS.md` | **99 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
 | `PRACTICES.md` | **工程实践手册**：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 | **新板 bring-up 前、写协议或标定模块前、收尾前**；想知道"怎么做对"（不是"怎么被坑"）时 |
 
 ### 🔟 十条最高频的坑（内联速查，全文见 PITFALLS.md）

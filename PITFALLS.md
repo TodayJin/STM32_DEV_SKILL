@@ -786,3 +786,14 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
   - 空闲也在大量跳变 → RX 悬空（收发器没供电/RE 没使能）。
   之后再数 `USART->ISR.RXNE` 事件数，确认外设本身能收到字节（本例 200ms 收到 2298 字节）。
 - 相关：#96（GPIO 探针思路）、#93（bring-up 顺序）。
+
+### 99. 串口「一个字节都收不到」先查 TX/RX 是不是画反了 —— USART 的 CR2.SWAP 能在固件里救回来
+- 现象：某一路 485/UART 完全不通（发出去没回、收不到），但同型号其它几路正常；用 GPIO 采样它的 RX 脚能看到总线上的数据 → 收发器、线、供电都好，**问题在 MCU 引脚分配**。
+- 常见根因：**原理图把 TXD/RXD 画反**。取名要按芯片手册核，不能按"PE0 在前所以是 TX"直觉。典型坑：STM32 上 **PE0 = UART8_RX、PE1 = UART8_TX**（和很多人以为的相反）。
+- 判定：查手册 Table "Alternate function mapping"；或把该脚临时配成 GPIO 输入，发送期间数跳变（有跳变 = 信号到了这脚），再核这脚到底是 UARTx_TX 还是 UARTx_RX。
+- 固件兜底（不用改板）：STM32 的 USART 支持**引脚交换**位 `USART_CR2.SWAP`，HAL 里用
+  `huart.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT;`
+  `huart.AdvancedInit.Swap = UART_ADVFEATURE_SWAP_ENABLE;`
+  **必须在 `HAL_UART_Init()` 之前设置**；初始化后读 `USARTx->CR2` 的 bit15 应为 1，否则说明没生效（参数没赋进结构体是常见笔误）。
+- 注意：这只交换 TX/RX 两根脚，DE/RE 方向控制脚不受影响；仍要按收发器实际接法驱动。
+- 相关：#98（485 自测）、#96（GPIO 探针判线束）。
