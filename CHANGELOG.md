@@ -1,5 +1,22 @@
 # Changelog — stm32-dev 技能
 
+## 3.17.5 (2026-10-21) —— PDH-1 实板 bring-up 的三条实战坑 + 修 `new` 的 `make flash`
+
+**修：脚手架生成的 `make flash` 在 Windows 上不可用**
+- 现场：`make flash` 报 `'tools' 不是内部或外部命令`。根因是 Makefile 把 `tools/stm32-dev-run.cmd` 当命令直跑：
+  make 在 Windows 多走 `cmd.exe`（不认正斜杠），换 git-bash 的 `sh` 又不认 `.cmd`，包装器两边都不稳。
+- 现在 `new` 直接把 `RUN` 写成 `"<python>" "<技能>/scripts/stm32-dev.py"`，两种 shell 通吃。
+
+**PITFALLS 新增 3 条（90~92）**
+- **#90** `make flash` 报「'tools' 不是内部或外部命令」→ 别修包装器，改成直调脚本。
+- **#91** `SEGGER_RTT_printf` **不支持 `%f`**：浮点列消失、后面 `%s` 变 `(NULL)`、参数表错位。量化成整数再打。
+- **#92** HAL 结构体成员随 Cube 包版本变（如 `I2C_InitTypeDef` 没有 `AnalogFilter/DigitalFilter`）→ 先看当前包头文件再写初始化。
+
+**实践佐证（PDH-1 板）**
+- 6 颗 INA238（地址 0x40/41/42/44/45/46，其中两颗 A0 接 SDA）+ MCP4728（0x60）在同一块板上全部读通：
+  厂商号 0x5449、器件号 0x2381、DAC 写入 4095 后回读 `FF F8` 一致。
+- 记一个**驱动细节**（不属于技能，但同类芯片通用）：INA238 的 `DIETEMP` 是 12 位有效值**左对齐**在 bit15..4，读回必须 `>>4` 再乘 0.125°C，否则温度会读出 700°C 这种数量级。
+
 ## 3.17.4 (2026-10-11) —— `--check-seq` 不再把两条同名序列混成一条（自报帧实战）
 
 **修：同名序号列被混成一条 → 假丢帧**

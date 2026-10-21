@@ -3418,7 +3418,8 @@ def cmd_init_rtt(args):
         print("从 J-Link 安装目录复制 RTT 源码: %s" % src_dir)
     if not copied:
         print("!! J-Link 安装目录里没找到 RTT 源码(新版安装包常不含) -> 改从 SEGGER 官方仓库取。")
-        copied = _fetch_rtt_sources(dst, verbose=args.verbose, offline=args.offline)
+        copied = _fetch_rtt_sources(dst, verbose=getattr(args, "verbose", False),
+                                offline=getattr(args, "offline", False))
     if not copied:
         print("   手动取法(BSD 许可): https://github.com/SEGGERMicro/RTT")
         print("   需要: " + ", ".join(want))
@@ -5114,7 +5115,8 @@ def cmd_new(args):
                          .replace("@@SYS_OBJ@@", os.path.basename(layout["system"])[:-2] + ".o")
                          .replace("@@STARTUP_OBJ@@", os.path.basename(startup)[:-2] + ".o")
                          .replace("@@PREFIX@@", prefix)
-                         .replace("@@RUN@@", "tools/stm32-dev-run" + (".cmd" if os.name == "nt" else ".sh"))
+                         .replace("@@RUN@@", '"%s" "%s"' % (python.replace("\\", "/"),
+                                                            os.path.abspath(__file__).replace("\\", "/")))
                          .replace("@@CPU@@", cpu).replace("@@FPU@@", mfpu).replace("@@ABI@@", abi))
     files["linker.ld"] = (_LD_TPL.replace("@@TARGET@@", name).replace("@@FLASH@@", flash)
                           .replace("@@RAM@@", ram).replace("@@MEM_SRC@@", mem_src))
@@ -5871,6 +5873,7 @@ def build_parser():
     s.add_argument("--subdir", default=os.path.join("Middlewares", "SEGGER_RTT"), help="存放子目录")
     s.add_argument("--offline", action="store_true",
                    help="J-Link 安装目录里没有源码时, 也不要联网去官方仓库取")
+    s.add_argument("--verbose", action="store_true", help="打印取源码的过程")
     s.set_defaults(func=cmd_init_rtt)
 
     s = sub.add_parser("blackbox"); add_common(s)

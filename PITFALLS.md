@@ -163,6 +163,7 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
 - 根因：RTT = 目标侧代码（控制块 `_SEGGER_RTT` + 读写实现）+ 主机侧客户端，**J-Link 只是通道**。固件里没有 RTT 代码，就永远不会有输出。
 - 通用做法：① 确认固件里有 RTT 源码且调用了 `SEGGER_RTT_Write*/printf`；② 检查 J-Link 安装目录 `Samples/RTT`（**新版安装包可能不含**，从 SEGGER 官方仓库取，BSD 许可）；③ 客户端指定 `-RTTChannel 0`；④ 自动搜索控制块失败时用 `-RTTSearchRanges <start> <size>` 或 `-RTTAddress` 显式指定。
 - 判定：客户端打印 `Searching for RTT Control Block...OK` 才算目标侧就绪。
+- **缓冲大小要按"最大一次输出量"给**：默认 1KB，抓包时往往只看到最新一小段、前面的日志被自己冲掉（实测：自测一次打 6KB+，缓冲给小了只剩尾巴；给到 16KB 才完整）。抓"开机自检/上电横幅"这类一次性输出，要在**复位后立刻抓**，自动搜索控制块失败时显式带 `--address <_SEGGER_RTT 地址>`。
 
 ### 28. RTT 阻塞模式 + 无主机读取 = 固件真卡死
 - 现象：程序"卡死"，PC 停在 `SEGGER_RTT_Write*` 内部；关掉 RTT 客户端后现象消失——比 halt 假象更隐蔽，因为它是真的卡住。
@@ -247,6 +248,7 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
 
 ### 40. make 不跟踪 Makefile 的 -D 改动
 改了 Makefile 里的 `-DXXX` 后直接 `make`，GNU make 只看源文件时间戳，**不会重编译**，于是你以为新宏编进去了，实际还是旧固件（实测浪费一整轮测试）。**改编译选项后必须 `make clean` 或 touch 源文件**，并用行为验证宏是否生效（而不是看构建「成功」）。
+- 同一个陷阱的另一半：`new` 生成的 Makefile **没有头文件依赖（无 `-MMD -MP`）**，改 `*.h` 后 `make` 同样不会重编那个 `.c`（实测：改 `SEGGER_RTT_Conf.h` 的 `BUFFER_SIZE_UP`，`make` 报成功而 `bss` 一点没变 = 改动静默失效）。**改任何 `.h` 后也要 `make clean && make`**；根治办法是在 Makefile 里加 `-MMD -MP` 与 `-include $(OBJS:.o=.d)`。
 
 
 ### 41. 控制增益不能照抄型号（D 项饱和会变成极限环 → 发热）
@@ -709,4 +711,24 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
 - 做法：**空载**下写 `0x09 = 1` → 复读确认归零（本例 −437g → −10g → **0g**，连读 5 次稳定）→ **保存到 flash**（本例 `0x1C = 1`），否则下次上电又回去了。
 - **通用规则**：任何"力 / 力矩 / 电流 / 位置"的绝对量传感器，**上电第一次使用前都要有一个明确的零点标定步骤**，并且要能持久化。把"空载读数不为 0"当成正常，等于把整个闭环判据建立在错误基准上。
 - 相关：#69、#70、#3。
+
+### 90. `new` 脚手架生成的 `make flash` 在 Windows 上直接报「'tools' 不是内部或外部命令」
+- 现象：`make flash` 输出 `'tools' 不是内部或外部命令，也不是可运行的程序`，而 `tools/stm32-dev-run.cmd` 明明就在。
+- 根因：Makefile 把 `RUN := tools/stm32-dev-run.cmd` 当命令直接执行 —— ① make 在 Windows 上多半走 `cmd.exe`，命令里的**正斜杠**不认；② 换到 git-bash 的 `sh` 又不认 `.cmd`。两个 shell 没法用同一种写法，**包装器这条路本身不稳**。
+- 正确做法：Makefile 里直接调脚本，两种 shell 通吃：
+  `RUN := "$(PYTHON)" "<技能目录>/scripts/stm32-dev.py"` + `$(RUN) flash --elf ...`（`new` 已按这个生成）。
+  手工排查同理：`python <技能>/scripts/stm32-dev.py flash --elf build/xxx.elf --device STM32H743VI`，别绕 `.cmd`。
+- 判定：见到这句就不要再在包装器上折腾，改成直调。
+
+### 91. `SEGGER_RTT_printf` **不支持 %f**，浮点会静默吃掉后面的参数
+- 现象：一行里同时有 `%d %f %s` 时，浮点列**整个消失**，后面的 `%s` 变成 `(NULL)`，行内容像被截断。
+- 根因：SEGGER 自带的是精简 printf，只认整型/字符串/指针；`%f` 不被识别 —— **不报错，但参数表从此错位**。
+- 做法：浮点先在固件里量化成整数再打（`(int)(x*1000+0.5)` 打 mV/µA/0.1°C），表头写清单位；要真浮点就换 newlib printf 或自己格式化。
+- 相关：#27、#28（RTT 缓冲/阻塞）。
+
+### 92. HAL 结构体成员随 Cube 包版本变，编译报"没有这个成员"就按头文件改
+- 现象：`error: 'I2C_InitTypeDef' has no member named 'AnalogFilter'`（STM32Cube_FW_H7 1.13.0 / HAL 1.11.x）。
+- 原因：`AnalogFilter` / `DigitalFilter` 只在部分系列或版本里有；照抄别的系列/网上的初始化代码就会踩。
+- 做法：打开当前包的 `stm32h7xx_hal_i2c.h` 看 `I2C_InitTypeDef` 真实成员，多余的直接删、缺的按头文件补。**先看头文件，再写初始化**。
+- 相关：#8（寄存器地址先核头文件）。
 
