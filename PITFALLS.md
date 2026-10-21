@@ -766,3 +766,23 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
 - 关键点：**悬空输入**会被外设内部上拉抬到 3.3V，看起来"像有信号"，这是最容易骗过静态测量的地方；而 SPI 模式 0 的 SCK **空闲是 0V**，静态读到 3.3V 本身就是异常。
 - 判定顺序：先 GPIO 翻转验线束（本节）→ 再恢复外设功能跑传输 → 最后才怀疑器件本身。
 - 相关：#93（bring-up 顺序）、#8。
+### 97. H7 的 FDCAN 必须显式配置「消息 RAM 元素数量」，否则 TX/RX FIFO 长度都是 0
+- 现象：CAN 一帧都发不出去也收不到；`HAL_FDCAN_Init` 返回 `HAL_OK`，`AddMessageToTxFifoQ` 也不报错，但总线毫无反应，`PSR.LEC=7`、`TEC=REC=0`（连错误计数都不涨 = 根本没尝试发送）。
+- 根因：STM32H7（M_CAN 内核）的 `FDCAN_InitTypeDef` 里有 **`RxFifo0ElmtsNbr` / `RxFifo1ElmtsNbr` / `RxBuffersNbr` / `TxBuffersNbr` / `TxFifoQueueElmtsNbr` / `TxEventsNbr`** 这些**消息 RAM 元素数量**字段。F1/F4 的 bxCAN 没有这些概念，照旧习惯初始化 = 全 0 = `SIDFC/RXF0C/TXBC` 全写成 0 个元素。寄存器上表现为 `SIDFC.LSS=0`、`RXF0C.F0S=0`、`TXBC.NDTB=0`。
+- 正确做法：初始化结构里逐项给足，例如
+  `RxFifo0ElmtsNbr=16; RxFifo0ElmtSize=FDCAN_DATA_BYTES_8; StdFiltersNbr=2; TxFifoQueueElmtsNbr=8; TxFifoQueueMode=FDCAN_TX_FIFO_OPERATION; TxElmtSize=FDCAN_DATA_BYTES_8;`（其余 RxBuffers/TxBuffers/TxEvents/RxFifo1 置 0）。
+- 判定：读 `SIDFC(0x84)`/`RXF0C(0xA0)`/`TXBC(0xC0)`，元素数字段为 0 就是这条。
+- 先验方法：**内部回环（`FDCAN_MODE_INTERNAL_LOOPBACK`）自发自收 10 帧**。回环能收到 = 时钟/波特率/过滤器/消息RAM 都对，问题只在总线或收发器；回环也收不到 = 配置问题，别去动硬件。
+- 注意：内部回环模式下 HAL 会置 `CCCR.MON=1`（总线监听），这是**正常**的，不是错误。
+- 相关：#8（寄存器先核手册）。
+
+### 98. RS-485 半双工自测：别逐帧切 DE，也别用 HAL 阻塞接收（两个都会假失败）
+- 现象：两片 485 互连、A/B 接对、收发器供电正常（VISO 5V）、DE 电平也对，但一帧都收不到；`USART_ISR` 里却挂着 `PE/NF/ORE`。
+- 根因有两个，都会造成"硬件没问题但测试全红"：
+  1) **`ORE`/`FE`/`NE`/`PE` 一旦置位，HAL 的阻塞式 `HAL_UART_Receive` 会直接返回错误**，后续每帧都被判坏帧。开始收发前必须清：`h->Instance->ICR = USART_ICR_PECF|USART_ICR_FECF|USART_ICR_NECF|USART_ICR_ORECF;`（注意 H7 里是 **NECF**，不是 NCF）。
+  2) **逐帧切 DE**（发 4 字节 → DE 拉低 → 再收）会把帧边界和总线切换搅在一起，实测必挂。正确做法是**流式**：DE 拉高一次，把整批帧连续发完（`TXFNF` 置位就写 `TDR`），**同一循环里轮询 `RXNE` 边收边解析**，发完且静默 30ms 再拉低 DE。
+- 快速定位手段（不用示波器）：发送期间把 RX 脚临时当 **GPIO 输入**采样 `IDR`，数跳变：
+  - 空闲时跳变 **0**、发送时跳变上万 → 总线和收发器都正常，问题在 UART 配置/测试方法；
+  - 空闲也在大量跳变 → RX 悬空（收发器没供电/RE 没使能）。
+  之后再数 `USART->ISR.RXNE` 事件数，确认外设本身能收到字节（本例 200ms 收到 2298 字节）。
+- 相关：#96（GPIO 探针思路）、#93（bring-up 顺序）。
