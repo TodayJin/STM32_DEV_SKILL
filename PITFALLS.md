@@ -3,7 +3,7 @@
 > 主文件：`SKILL.md`；观测手段：`OBSERVE.md`；工程实践手册：`PRACTICES.md`。
 > **遇到怪现象先搜这里** —— 89 条都是真金白银换来的。
 
-## ⚠️ 踩坑记录（94 条实战坑，务必先读）
+## ⚠️ 踩坑记录（95 条实战坑，务必先读）
 
 **按主题索引（对着现象找条号）**：
 
@@ -748,3 +748,12 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
   - **心跳还在推进** → 程序没卡，是抓包侧的问题（抓早了/抓晚了、缓冲被自己覆盖）→ 加长 `--seconds`、复位后立刻抓、或把 `BUFFER_SIZE_UP` 加大（#27）；
   - **心跳也停了** → 才是真卡死，按 #28（RTT 阻塞）/#32（HardFault）查。
 - 固件侧配合：初始化每段写一个 `.noinit` 阶段号（20/21/22…），卡住时直接读出停在哪一段，比反推日志快得多。
+
+### 95. H7 的 SPI1/2/3 内核时钟默认是 PLL1Q —— 不开 PLL 时 SPI 一动不动
+- 现象：SPI 外设"没反应"（屏全黑、DAC 不更新），但代码没死：`HAL_SPI_Transmit` 每次都在等 `TXP` 标志直到超时；一旦地查会发现 `uwTick` 在走、每次传输耗满 100ms（320 行屏 = 32 秒）。
+- 根因：STM32H7 的 **SPI1/2/3 内核时钟来自 `RCC_D2CCIP1R.SPI123SEL`，复位值 = PLL1Q**。工程若没开 PLL（比如本工程 `USE_PLL_480MHZ 0`），SPI 内核时钟为 0，移位寄存器不动，TXP 永不置位。**I²C 不受影响**（它的 `I2C123SEL` 复位就是 PCLK1），所以常表现为"I²C 全好、SPI 全哑"。
+- 正确做法（不依赖 PLL）：
+  `RCC->D2CCIP1R = (RCC->D2CCIP1R & ~RCC_D2CCIP1R_SPI123SEL) | RCC_D2CCIP1R_SPI123SEL_2;`（= CLKP/per_ck，复位默认 HSI 64MHz）。
+  不要用 `HAL_RCCEx_PeriphCLKConfig(RCC_PERIPHCLK_SPI2)` 走 HAL —— 实测它会进 PLL3 配置分支，把栈搅乱。
+- 判定：`HAL_SPI_Transmit` 超时 + `uwTick` 正常走 + I²C 正常 = 先查这条。
+- 相关：#8（寄存器先核手册）。
