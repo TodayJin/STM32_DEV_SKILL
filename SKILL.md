@@ -7,14 +7,14 @@ description: |
   观测手段分层（串口探针帧/RTT 上行/RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查
   （`preflight`：拿技能里的结论把现有工程扫一遍，机械项自动判、判不了的列人工清单）**、
   空项目脚手架（`new`：自动搭 Makefile 工程 + 按调试器配好）、串口观测（`serial`）、27 个命令、
-  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（99 条实战坑）与 PRACTICES.md（工程实践手册：
+  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（100 条实战坑）与 PRACTICES.md（工程实践手册：
   上电时序 / 协议从站 / 控制与标定 / 状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）、
   PROBES.md（三种调试器各自的坑 / 可用工具 / 最强用法 / 降级路径）、SETUP.md（工具链怎么装、装在哪）。
   适用前提：已有 GNU Make/CMake 工程，或用 `new` 现场生成；不负责 Keil/CubeIDE 工程生成
   （那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.19.2
+  version: 3.20.1
   date: "2026-10-21"
 ---
 
@@ -129,6 +129,17 @@ python3 .../stm32-dev.py preflight --json                         # CI / 脚本�
 **CS 粒度也是参数**：原厂驱动常见“每个命令/数据字节各自拉一次 CS”，也有整段保持低电平的写法；某些模块只认其中一种，现象同样是全黑。照抄原厂的那种，不要在初始化阶段自作主张合并。
 
 **只有写、没有读的 SPI 屏（4 线 SPI LCD）：用 `SPI_DIRECTION_1LINE`（半双工）**，不要为了“跟参考库一致”开 2LINES —— 2LINES 会把 MISO 脚配成 AF，而板内那根脚常常已经被别的功能占用（编码器、风扇测速、第二路 UART）。CS/DC 照旧用 GPIO，功能没有任何损失。
+
+**照搬任何例程/开源工程时，先核四样，否则“能编译”但一定不工作**：① **MSP 引脚表**（`HAL_xxx_MspInit` 是按它自己那块板写的，TX_EN/TXD0 这类脚经常只差一两根没配）；② **启动调用**（`HAL_ETH_Start` / `HAL_xxx_Start` 常藏在 link-up 回调里，被“简化”掉就收不齐）；③ **DMA 可访问的内存区**（H7 的 ETH DMA 看不到 DTCM 0x2000_0000，描述符/缓冲必须放 AXI SRAM 0x2400_0000）；④ **接口模式位**（H7 的 RMII/MII 由 `SYSCFG->PMCR.EPIS_SEL` 选、复位默认是 MII；只配引脚不写这一位，九根 RMII 线全白配）。
+
+**核实方式（引脚类改动必做）**：把网表导成「元件.脚 → 网络」的表，**逐脚对照固件的 AF 配置**，不要凭芯片手册的“标准 AF”想当然，更不要信设计文档里的端子编号（它经常和网表脱节）。技能自带 `scripts/netlist_pins.py`：
+
+```bash
+python3 scripts/netlist_pins.py board.tel --part U21 U18     # 每个脚接哪个网络
+python3 scripts/netlist_pins.py board.tel --net PC4 PC5 PA7  # 反查：这几根网络上有哪些脚
+```
+
+支持 EasyEDA 的 `.tel`（`$NETS` 文本段）与 `.enet`（JSON）。
 
 **点亮一个新模块的顺序（别一上来就调驱动）**：
 1. **先验线束**：把可疑信号脚临时配成 GPIO 输出 1kHz 方波，万用表量到 **≈1.6V** 才说明“MCU→焊盘→串联电阻→座子”整条通（PITFALLS #96）。悬空输入会被模块内部上拉成 3.3V，静态测量最容易被它骗过；SPI 模式 0 的 SCK 空闲本来就该是 0V，读到 3.3V 本身就是异常。
@@ -462,9 +473,10 @@ make flash             # 重烧
 | `references/h743-hal-bringup.md` | **H743 裸机工程 bring-up**：`new` 内存参数、接 Cube HAL（Makefile/conf/按需模块）、时钟树单独一次改（480MHz 顺序与 PLL 取值）、无时钟⇒SWD 失联与 BOOT0 救砖、不用外设的时钟/时基验收、**假硬件 + RTT 断言自测** | 新工程 bring-up、要先把逻辑跑通、调试口连不上时 |
 | `references/spi-lcd-bringup.md` | **4 线 SPI 小屏 bring-up**：ST7789P3 原厂初始化表（0xD0 双写、D6=A1、per-byte CS）、ST7789 各子型号差异、1LINE 释放 MISO、分色带/上红下蓝自检、**无 MISO 不能读回显存**、帧长/CS 粒度阶梯与提速下界 | 点一块 SPI TFT、屏幕全黑/花屏/变慢时 |
 | `references/bus-loopback-bringup.md` | **通信口 bring-up**：RS485/CAN 两路对打（接线、DE 与 TC 时序、直流驱动测试、序号+校验判据）、隔离收发器上电测点、**FDCAN 先做内部回环**、**收不到时的寄存器签名**（UART PE/NF/ORE=RX 悬空；FDCAN 消息 RAM 元素数为 0 ⇒ FIFO 长度 0，TEC=0 且 TXFQS 自由槽位 0；FDCANSEL 默认 HSE 的坑；TXFQS/CCCR 等偏移以 CMSIS struct 为准）、以太网“先交换层后协议栈”分层 | 新板第一次验 485/CAN/网口、或“发得出去收不到”时 |
+| `references/h7-eth-lwip-bringup.md` | **H7 以太网 bring-up（RMII PHY → MAC/DMA → lwIP 裸机）**：MDIO 位翻转读 ID/BMSR 与采样偏移、**描述符/缓冲必须放 AXI SRAM（DTCM DMA 访问不到，症状是 SR 自清、RX 恒 0）**、MSP 引脚表按网表重写、`HAL_ETH_Start` 不可漏、**RMII/MII 模式位（`SYSCFG->PMCR.EPIS_SEL`，读 PMCR 注意偏移 0x04）**、广播/混杂过滤（ARP 是广播）、HAL v1.13 的 ReadData/Transmit 接口、静态 IP 与 APIPA 169.254/16、Windows 防火墙不拦入站 ICMP 的误判、**REF_CLK 边沿探针与 PHY 内部回环（BMCR bit14）组成的四步 RX 判据** | 第一次点网口、PHY link 亮但 ping 不通、lwIP 收不到帧时 |
 | `references/small-peripheral-recipes.md` | **小幅外设配方**：有源蜂鸣器（非阻塞单次短鸣）、4 线风扇（25kHz PWM + TACH EXTI + RPM 公式与实测单调性）、背光/EN 上电安全态、TIM 需要的 HAL 模块 | 接蜂鸣器/风扇/背光、或“先测一下这个小器件”时 |
 | `references/h7-flash-and-halt-triage.md` | **烧录路径与“卡死”三分诊断**：烧 bin 不烧 hex（全零字节丢失导致 verify 报个别字节不同）、烧完必须 `r`+`g`、CFSR/时基/`g_boot_stage` 三招区分 HardFault 与 HAL 超时、探针速率怎么定 | 烧完“没生效”、RTT 抓不到、看着像死机时 |
-| `PITFALLS.md` | **99 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
+| `PITFALLS.md` | **100 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
 | `PRACTICES.md` | **工程实践手册**：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 | **新板 bring-up 前、写协议或标定模块前、收尾前**；想知道"怎么做对"（不是"怎么被坑"）时 |
 
 ### 🔟 十条最高频的坑（内联速查，全文见 PITFALLS.md）
@@ -513,6 +525,7 @@ stm32-dev/
 ├── CHANGELOG.md        (版本演进)
 └── scripts/
     ├── stm32-dev.py    (单文件引擎, 27 个命令, 仅标准库*; --json 输出)
+    ├── netlist_pins.py (从 EasyEDA .tel/.enet 导出「元件.脚 → 网络」, 核固件引脚配置用)
     └── jlink_speed_sweep.sh  (SWD 速率扫描: 各档读回比 md5 + 计时, 定探针最高可用速度)
 ```
 

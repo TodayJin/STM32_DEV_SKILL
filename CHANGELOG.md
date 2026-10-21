@@ -401,3 +401,6 @@ cleanup 默认只报告不动手。
 
 ## 3.19.1 (2026-10-21)
 - PITFALLS #99: 串口全哑先查 TX/RX 是否画反(如 PE0=UART8_RX / PE1=UART8_TX)，用 USART CR2.SWAP 在固件里救回，附"初始化后读 CR2 bit15 验证"的检查点。
+
+## 3.19.2 (2026-10-21)
+- PITFALLS #100: H7 以太网链路正常但收发全哑的三连坑 —— nINTSEL strap 未拉低导致无 50MHz REF_CLK（用 TIM 外部计数判定，别用 GPIO 采样）、DMA 缓冲必须放 AXI SRAM、Cube 例程 MSP 用的是 Nucleo 引脚。

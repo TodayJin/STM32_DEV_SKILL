@@ -797,3 +797,14 @@ test 的 Modbus 在 USART1(TTL)，没接 USB-TTL/J-Link VCOM 就没通路。**�
   **必须在 `HAL_UART_Init()` 之前设置**；初始化后读 `USARTx->CR2` 的 bit15 应为 1，否则说明没生效（参数没赋进结构体是常见笔误）。
 - 注意：这只交换 TX/RX 两根脚，DE/RE 方向控制脚不受影响；仍要按收发器实际接法驱动。
 - 相关：#98（485 自测）、#96（GPIO 探针判线束）。
+
+### 100. H7 以太网「链路正常但一帧收发都没有」——先量 REF_CLK，再查 DMA 内存位置
+- 现象：MDIO 能读到 PHY（ID/BMSR 正常）、link up、100M，MAC 寄存器都配好了（RE/TE=1、FES=1、RMII 模式位=1），但 RX 帧计数恒为 0，`HAL_ETH_Transmit` 还返回 `HAL_OK`。
+- 三个独立的坑，按顺序排：
+  1) **RMII 需要 50MHz REF_CLK**。LAN8720/8710 的 50MHz 由 `nINT/REFCLKO` 脚输出，**该脚只有 `nINTSEL` strap 拉到 VSS 时才输出时钟**（悬空/上拉 = nINT 中断模式，默认）。很多板子把它复用成 LED2、只串电阻+LED 到地，复位采样拉不低 → 没有时钟 → MAC 收发全哑，但链路照样 up（那是 PHY↔对端 PHY 的事）。
+     **判据**：用 **TIMx 外部时钟模式 1** 数 PA1 的边沿（`SMS=111, TS=TI2FP2, CC2S=01`），100ms 窗口应为 ~5,000,000；**GPIO 采样数边沿不可靠——悬空脚采到的是噪声**，会误判成"有时钟"。
+  2) **DMA 描述符/收发缓冲必须放 AXI SRAM（0x2400_0000）**。链接脚本默认把它们丢在 DTCM（0x2000_0000），ETH DMA 访问不到，表现为 RX DMA 的 `SR` 位置 1 后立刻被清、0 帧。
+     做法：链接脚本加 `ETH_RAM (xrw) : ORIGIN = 0x24000000, LENGTH = 64K`，把 `.RxDescripSection/.TxDescripSection/.eth_dma` 放进去；lwIP 的 pbuf 在 DTCM，发送时要**拷进 AXI 里的静态缓冲**再交给 `HAL_ETH_Transmit`。
+  3) **Cube 例程的 `HAL_ETH_MspInit` 是 Nucleo 板引脚**（含 PG2/PG11/PG13），换板后必须按自己网表改，否则 TX_EN/TXD0 这些脚根本没配成 AF11 —— 少两根线就全哑。
+  另：`SYSCFG->PMCR.EPIS_SEL`（bit23）= RMII、=0 是 MII；H7 上 HAL 有时不生效，建议显式写一次；注意 PMCR 偏移是 **0x04**（读 0x00 会一直读到 0，误判成 MII）。
+- 相关：#97（FDCAN 消息 RAM）、#99（串口 TX/RX 接反）。
