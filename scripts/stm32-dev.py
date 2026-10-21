@@ -4820,7 +4820,11 @@ CUBE_INC := @@CUBE_INC@@
 CORE_INC := @@CORE_INC@@
 STARTUP  := @@STARTUP@@
 SYS_SRC  := @@SYS_SRC@@
-RUN      := @@RUN@@
+# 烧录/调试走技能脚本。默认用 PATH 里的 python + 生成时记下的技能路径;
+# 换机器/换解释器/技能搬了位置, 用命令行覆盖即可: make flash PYTHON=py STM32DEV=...
+PYTHON   ?= python
+STM32DEV ?= @@RUN@@
+RUN      := "$(PYTHON)" "$(STM32DEV)"
 
 BUILD    := build
 PREFIX   := @@PREFIX@@
@@ -5115,8 +5119,7 @@ def cmd_new(args):
                          .replace("@@SYS_OBJ@@", os.path.basename(layout["system"])[:-2] + ".o")
                          .replace("@@STARTUP_OBJ@@", os.path.basename(startup)[:-2] + ".o")
                          .replace("@@PREFIX@@", prefix)
-                         .replace("@@RUN@@", '"%s" "%s"' % (python.replace("\\", "/"),
-                                                            os.path.abspath(__file__).replace("\\", "/")))
+                         .replace("@@RUN@@", os.path.abspath(__file__).replace("\\", "/"))
                          .replace("@@CPU@@", cpu).replace("@@FPU@@", mfpu).replace("@@ABI@@", abi))
     files["linker.ld"] = (_LD_TPL.replace("@@TARGET@@", name).replace("@@FLASH@@", flash)
                           .replace("@@RAM@@", ram).replace("@@MEM_SRC@@", mem_src))

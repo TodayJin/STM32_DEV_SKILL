@@ -14,7 +14,7 @@ description: |
   （那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.17.5
+  version: 3.17.6
   date: "2026-10-11"
 ---
 

@@ -1,21 +1,33 @@
 # Changelog — stm32-dev 技能
 
-## 3.17.5 (2026-10-21) —— PDH-1 实板 bring-up 的三条实战坑 + 修 `new` 的 `make flash`
+## 3.17.6 (2026-10-21) —— `new` 的 RUN 改成可覆盖模板（去掉机器绑定）
 
-**修：脚手架生成的 `make flash` 在 Windows 上不可用**
-- 现场：`make flash` 报 `'tools' 不是内部或外部命令`。根因是 Makefile 把 `tools/stm32-dev-run.cmd` 当命令直跑：
-  make 在 Windows 多走 `cmd.exe`（不认正斜杠），换 git-bash 的 `sh` 又不认 `.cmd`，包装器两边都不稳。
-- 现在 `new` 直接把 `RUN` 写成 `"<python>" "<技能>/scripts/stm32-dev.py"`，两种 shell 通吃。
+- 3.17.5 把解释器与技能路径直接拼进 `RUN`，换机器/换解释器就得改 Makefile。现在拆成三行可覆盖变量：
+  ```
+  PYTHON   ?= python
+  STM32DEV ?= <技能脚本路径>
+  RUN      := "$(PYTHON)" "$(STM32DEV)"
+  ```
+  `make flash PYTHON=py STM32DEV=...` 即可覆盖；模板本身不再绑定某一台机器、某一个解释器或技能安装位置。
+- 实测：`new` 生成后 `make -n flash` 输出 `"python" ".../stm32-dev.py" flash --elf build/<t>.elf`；用命令行覆盖 `STM32DEV` 后同样生效。
+- 说明：3.17.5 里混进 CHANGELOG 的项目名与器件型号已删除，条目只保留通用结论。
 
-**PITFALLS 新增 3 条（90~92）**
-- **#90** `make flash` 报「'tools' 不是内部或外部命令」→ 别修包装器，改成直调脚本。
-- **#91** `SEGGER_RTT_printf` **不支持 `%f`**：浮点列消失、后面 `%s` 变 `(NULL)`、参数表错位。量化成整数再打。
-- **#92** HAL 结构体成员随 Cube 包版本变（如 `I2C_InitTypeDef` 没有 `AnalogFilter/DigitalFilter`）→ 先看当前包头文件再写初始化。
+## 3.17.5 (2026-10-21) —— Windows 上 `make flash` 跑不通 + 两条「静默失效」坑
 
-**实践佐证（PDH-1 板）**
-- 6 颗 INA238（地址 0x40/41/42/44/45/46，其中两颗 A0 接 SDA）+ MCP4728（0x60）在同一块板上全部读通：
-  厂商号 0x5449、器件号 0x2381、DAC 写入 4095 后回读 `FF F8` 一致。
-- 记一个**驱动细节**（不属于技能，但同类芯片通用）：INA238 的 `DIETEMP` 是 12 位有效值**左对齐**在 bit15..4，读回必须 `>>4` 再乘 0.125°C，否则温度会读出 700°C 这种数量级。
+**修：脚手架生成的 `make flash` 在 Windows 上不可用（通用修复）**
+- 现场：`make flash` 报 `'tools' 不是内部或外部命令`。根因：Makefile 把 `tools/stm32-dev-run.cmd` 当命令直跑 —— make 在 Windows 上多走 `cmd.exe`（不认命令里的正斜杠），换成 git-bash 的 `sh` 又不认 `.cmd`；两个 shell 无法共用一种包装器写法。
+- 现在模板里改成可覆盖的三行，换机器/换解释器/技能搬家都不用改模板：
+  ```
+  PYTHON   ?= python
+  STM32DEV ?= <技能脚本绝对路径>
+  RUN      := "$(PYTHON)" "$(STM32DEV)"
+  ```
+  覆盖方式：`make flash PYTHON=py STM32DEV=/path/to/stm32-dev.py`。
+
+**PITFALLS 新增 3 条（90~92，均为通用项）**
+- **#90** `make flash` 报「'tools' 不是内部或外部命令」→ 别在包装器上折腾，改成直调脚本（模板已改）。
+- **#91** `SEGGER_RTT_printf` **不支持 `%f`**：浮点列整列消失、其后的 `%s` 变成 `(NULL)`、整行参数表错位且不报错。做法：先把浮点量化成整数再打，表头写清单位。
+- **#92** HAL 结构体成员随 Cube 包版本变（如某版本的 `I2C_InitTypeDef` 没有 `AnalogFilter/DigitalFilter`）→ 先打开当前包的 `stm32h7xx_hal_i2c.h` 看真实成员再写初始化，别照抄别的系列或网上例程。
 
 ## 3.17.4 (2026-10-11) —— `--check-seq` 不再把两条同名序列混成一条（自报帧实战）
 
