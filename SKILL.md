@@ -7,14 +7,14 @@ description: |
   观测手段分层（串口探针帧/RTT 上行/RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查
   （`preflight`：拿技能里的结论把现有工程扫一遍，机械项自动判、判不了的列人工清单）**、
   空项目脚手架（`new`：自动搭 Makefile 工程 + 按调试器配好）、串口观测（`serial`）、27 个命令、
-  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（102 条实战坑）与 PRACTICES.md（工程实践手册：
+  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（105 条实战坑）与 PRACTICES.md（工程实践手册：
   上电时序 / 协议从站 / 控制与标定 / 状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）、
   PROBES.md（三种调试器各自的坑 / 可用工具 / 最强用法 / 降级路径）、SETUP.md（工具链怎么装、装在哪）。
   适用前提：已有 GNU Make/CMake 工程，或用 `new` 现场生成；不负责 Keil/CubeIDE 工程生成
   （那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.26.3
+  version: 3.26.6
   date: "2026-10-22"
 ---
 
@@ -130,7 +130,7 @@ python3 .../stm32-dev.py preflight --json                         # CI / 脚本�
 **② 机械扫不出来的，列成人工清单**（`[ ]` 逐条对过）：请求队列是应答驱动还是发出即出队（#81）、
 读回来的值有没有做合理性检查（#82/#83）、寄存器单位查过手册没有（#84）、SRAM/EPROM 双寄存器与写锁
 （#85）、门卫条件互锁与派生状态缓存（#86/#87）、切模式的参数/模式书写顺序（#88）、模拟量零点标定入口
-（#89）、中断共享变量的 volatile/临界区（#57/#58）、偶发现象的黑匣子是否就绪（#32）。
+（#89）、中断共享变量的 volatile/临界区（#57/#58）、偶发现象的黑匣子是否就绪（#32）；**`*_ON_BOOT` 自检块里有没有 `*_init()` 调用**（关掉自检 = 关掉硬件：触摸/采样会静默失效，读 `CR1/CR2==0` 可判，PITFALLS #105）。
 
 **这一步只读，不改任何东西。** 扫完再决定先修哪个——先修地基，别先修症状。
 
@@ -437,6 +437,15 @@ RTT 控制块地址：`arm-none-eabi-nm <elf> | grep _SEGGER_RTT`（技能默认
 ```
 **任何"连不上/命令卡住/板子像死了"，先跑 cleanup，再谈别的** —— 十次有八次是残留进程占着 J-Link（`JLinkRTTLogger` 退出会留下 `JLinkGUIServer`）。注意：**杀包装脚本的父进程 ≠ 杀子进程**，用 Python/后台任务包一层启动 RTT 客户端时，客户端会变孤儿继续占设备。
 
+**cleanup 之后板子还是 "死"（ping 不通、界面不刷、触摸没反应）→ halt 拿 PC 定方向，别猜**：
+
+- PC 落在 `I2C_IsErrorOccurred()` / `HAL_I2C_*` 内并且在原地循环 = **从机把 SDA 拉死、HAL 在错误处理里死转**，主循环（网络轮询、触摸读取、界面刷新）全部停住。表象是整机假死，但 `CFSR = 0`、没有 HardFault —— 很容易被误判成"界面代码写死了"或"触摸芯片坏了"。
+- 三层兜底，缺一层就会反复复发：
+  1. **超时收到 5ms 级**：总线读写的 HAL 超时用 30~100ms 时，一次锁死就能卡住主循环半百毫秒，叠上轮询就是"卡死"；改成 5ms，失败成为可恢复的短事件。
+  2. **连续 3 次失败 → 总线恢复**：`HAL_I2C_DeInit` → 把 SCL/SDA 临时配成开漏 GPIO → 打 **9 个 SCL 脉冲 + 一个 STOP** → `i2c_bus_init()` 重配 + 从机重走复位时序。恢复次数记进 `g_xxx_recover` 全局，主机读得到，"到底好了没有"不靠感觉。
+  3. **IWDG（3s）兜底**：前两层没救回来时自动复位，至少不会变成"必须去拔电"的砖；代价是长耗时初始化（预建界面、写 Flash）之间要显式 `bsp_iwdg_kick()`，否则开机就被它咬。
+- 同理：外设"读数恒定"先查"读完之后该不该清/确认"（见 §8），总线"整机假死"先看 PC 落在哪个 HAL 循环里。
+
 芯片识别：自动从 ELF 读。失败用 `--device <完整型号>`。
 
 ### ⚡ 性能优化：先 start 常驻再反复 read（关键）
@@ -517,14 +526,14 @@ make flash             # 重烧
 | `PROBES.md` | **三种调试器**（J-Link / ST-Link / DAPLink）各自的：能力表、注意事项、能用的工具、最强用法、降级路径 | 换/买调试器、某个命令报"没探针"、想用某个高级功能时 |
 | `SETUP.md` | **工具链怎么装**：CubeCLT / STM32CubeProgrammer / OpenOCD / pyOCD / Cube 固件包 / 驱动 | 新机器、缺工具、探针认不出来时 |
 | `references/h743-hal-bringup.md` | **H743 裸机工程 bring-up**：`new` 内存参数、接 Cube HAL（Makefile/conf/按需模块）、时钟树单独一次改（480MHz 顺序与 PLL 取值）、无时钟⇒SWD 失联与 BOOT0 救砖、不用外设的时钟/时基验收、**假硬件 + RTT 断言自测** | 新工程 bring-up、要先把逻辑跑通、调试口连不上时 |
-| `references/spi-display-touch-bringup.md` | **SPI 彩屏 + 电容触摸全套**：CS 粒度阶梯与提速顺序、**SPI DMA 提速（必配 SPIx 中断 + AXI 缓冲，否则卡死；实测整屏 47ms/整页 193ms）**、MADCTL 四向自检、行缓冲按最大宽度开、**裁剪用运行时宽高**、整字一次 DMA、局部重刷、背光时序、**GT911 读点后必清 0x814E（不清就永远返回同一个点）**、厂家 `.cfg` 配置写入、两点靶点标定 + 标定存 Flash、沿触发点击（**pressed 标志在所有松手路径上都要清**）、卖家多压缩包先列全再解压、标定带配置版本、**先做 sys_api 接口层再排布局** | 点带触摸的 SPI 屏、“坐标不变/触摸没反应”、只能点第一次、刷新率不够、要改 UI 布局时 |
-| `references/lvgl-on-mcu.md` | **LVGL v9 上 MCU**：v8→v9 接口对照表、**flush 必须拷到独立 DMA 缓冲再交换字节（就地改 `px_map` 会「只有边框没文字」）**、**双缓冲异步 flush（`flush_ready` 只能在 DMA 完成中断里调；弱符号漏定义会死锁在 `wait_for_flushing`）**、**blit 整区域一次 DMA（逐行等 DMA = 160ms/屏）**、三个必调参数（**栈 16KB** / 堆放 AXI 用 `LV_MEM_ADR` / 显式 `LV_COLOR_FORMAT_RGB565`）、Makefile 用递归 `wildcard`（不能用 `$(shell find)`）、**中文字模必须 `--no-compress`（否则字变实心方块）+ 改文案后用 `scripts/lvgl_font_subset_check.py` 验缺字**、**用 J-Link dump 帧缓冲转 PNG 自己验收画面**、按 JSON 规格稿绝对坐标实现界面的工作流、**刷新迟滞与带宽↔帧率上限**、**单个 label 超宽导致每帧重排（flush 区域反复刷同一小块）**、**开机顺序：屏/LVGL 要排在网络与板测之前**、**全屏遮罩吞点击 / 手势抽屉闪退 / 屏幕滚动条**、**抽屉跟手（PRESSING + `lv_indev_get_vect`，可中途反悔）与首页隐退**、**零拷贝字节序 `LV_COLOR_FORMAT_RGB565_SWAPPED`（切换后必须 dump 复核，异常即回退）**、**`make` 报 `Nothing to be done` 时烧的是旧固件（比对 .bin 大小）**、**开机渐显渐隐动画** | 要在 MCU 上 GUI 框架、花屏/卡在 `lv_text_*`/只有边框没文字/中文方块、点卡片没反应或抽屉一闪就没、开机屏亮得晚、链接 RAM 溢出、按设计稿排多页面时 |
+| `references/spi-display-touch-bringup.md` | **SPI 彩屏 + 电容触摸全套**：CS 粒度阶梯与提速顺序、**SPI DMA 提速（必配 SPIx 中断 + AXI 缓冲，否则卡死；实测整屏 47ms/整页 193ms）**、MADCTL 四向自检、行缓冲按最大宽度开、**裁剪用运行时宽高**、整字一次 DMA、局部重刷、背光时序、**GT911 读点后必清 0x814E（不清就永远返回同一个点）**、**幽灵触点锁死（空闲时点计数在涨+坐标恒定 → 双清 + 重跑复位时序）**、厂家 `.cfg` 配置写入、两点靶点标定 + 标定存 Flash、沿触发点击（**pressed 标志在所有松手路径上都要清**）、卖家多压缩包先列全再解压、标定带配置版本、**先做 sys_api 接口层再排布局** | 点带触摸的 SPI 屏、“坐标不变/触摸没反应”、只能点第一次、刷新率不够、要改 UI 布局时 |
+| `references/lvgl-on-mcu.md` | **LVGL v9 上 MCU**：v8→v9 接口对照表、**flush 必须拷到独立 DMA 缓冲再交换字节（就地改 `px_map` 会「只有边框没文字」）**、**双缓冲异步 flush（`flush_ready` 只能在 DMA 完成中断里调；弱符号漏定义会死锁在 `wait_for_flushing`）**、**blit 整区域一次 DMA（逐行等 DMA = 160ms/屏）**、三个必调参数（**栈 16KB** / 堆放 AXI 用 `LV_MEM_ADR` / 显式 `LV_COLOR_FORMAT_RGB565`）、Makefile 用递归 `wildcard`（不能用 `$(shell find)`）、**中文字模必须 `--no-compress`（否则字变实心方块）+ 改文案后用 `scripts/lvgl_font_subset_check.py` 验缺字**、**用 J-Link dump 帧缓冲转 PNG 自己验收画面**、按 JSON 规格稿绝对坐标实现界面的工作流、**刷新迟滞与带宽↔帧率上限**、**单个 label 超宽导致每帧重排（flush 区域反复刷同一小块）**、**开机顺序：屏/LVGL 要排在网络与板测之前**、**全屏遮罩吞点击 / 手势抽屉闪退 / 屏幕滚动条**、**抽屉跟手（PRESSING + `lv_indev_get_vect`，可中途反悔）与首页隐退**、**零拷贝字节序 `LV_COLOR_FORMAT_RGB565_SWAPPED`（切换后必须 dump 复核，异常即回退）**、**`make` 报 `Nothing to be done` 时烧的是旧固件（比对 .bin 大小）**、**开机渐显渐隐动画**、**设置页真实控件（PWM 亮度/Slider+Toggle/空闲熄屏）与 Flash 持久化（32 字节对齐）**、**点击回调里建屏/切页会吃掉松手事件 → 之后所有点击（含返回）失效（界面预建；★ 别在 CLICKED 里用 lv_indev_wait_release，会把输入永久锁死）** | 要在 MCU 上 GUI 框架、花屏/卡在 `lv_text_*`/只有边框没文字/中文方块、点卡片没反应或抽屉一闪就没、点几下就全失效、开机屏亮得晚、链接 RAM 溢出、按设计稿排多页面时 |
 | `references/spi-lcd-bringup.md` | **4 线 SPI 小屏 bring-up**：ST7789P3 原厂初始化表（0xD0 双写、D6=A1、per-byte CS）、ST7789 各子型号差异、1LINE 释放 MISO、分色带/上红下蓝自检、**无 MISO 不能读回显存**、帧长/CS 粒度阶梯与提速下界 | 点一块 SPI TFT、屏幕全黑/花屏/变慢时 |
 | `references/bus-loopback-bringup.md` | **通信口 bring-up**：RS485/CAN 两路对打（接线、DE 与 TC 时序、直流驱动测试、序号+校验判据）、隔离收发器上电测点、**FDCAN 先做内部回环**、**收不到时的寄存器签名**（UART PE/NF/ORE=RX 悬空；FDCAN 消息 RAM 元素数为 0 ⇒ FIFO 长度 0，TEC=0 且 TXFQS 自由槽位 0；FDCANSEL 默认 HSE 的坑；TXFQS/CCCR 等偏移以 CMSIS struct 为准）、以太网“先交换层后协议栈”分层 | 新板第一次验 485/CAN/网口、或“发得出去收不到”时 |
 | `references/h7-eth-lwip-bringup.md` | **H7 以太网 bring-up（RMII PHY → MAC/DMA → lwIP 裸机）**：MDIO 位翻转读 ID/BMSR 与采样偏移、**描述符/缓冲必须放 AXI SRAM（DTCM DMA 访问不到，症状是 SR 自清、RX 恒 0）**、MSP 引脚表按网表重写、`HAL_ETH_Start` 不可漏、**RMII/MII 模式位（`SYSCFG->PMCR.EPIS_SEL`，读 PMCR 注意偏移 0x04）**、广播/混杂过滤（ARP 是广播）、HAL v1.13 的 ReadData/Transmit 接口、静态 IP 与 APIPA 169.254/16、Windows 防火墙不拦入站 ICMP 的误判、**REF_CLK 边沿探针与 PHY 内部回环（BMCR bit14）组成的四步 RX 判据** | 第一次点网口、PHY link 亮但 ping 不通、lwIP 收不到帧时（也含 Windows 三种 ping 回显 / “网络不可达”= 本机无路由，需给网卡加副地址） |
 | `references/small-peripheral-recipes.md` | **小幅外设配方**：有源蜂鸣器（非阻塞单次短鸣）、4 线风扇（25kHz PWM + TACH EXTI + RPM 公式与实测单调性）、背光/EN 上电安全态、TIM 需要的 HAL 模块 | 接蜂鸣器/风扇/背光、或“先测一下这个小器件”时 |
 | `references/h7-flash-and-halt-triage.md` | **含 `Failed to initialize DAP` 分诊**（应用侧判活 → 多档速度 → BOOT0，而不是先怀疑固件） | **烧录路径与“卡死”三分诊断**：烧 bin 不烧 hex（全零字节丢失导致 verify 报个别字节不同）、烧完必须 `r`+`g`、CFSR/时基/`g_boot_stage` 三招区分 HardFault 与 HAL 超时、探针速率怎么定 | 烧完“没生效”、RTT 抓不到、看着像死机、SWD 连不上时 |
-| `PITFALLS.md` | **102 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
+| `PITFALLS.md` | **105 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
 | `PRACTICES.md` | **工程实践手册**：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 | **新板 bring-up 前、写协议或标定模块前、收尾前**；想知道"怎么做对"（不是"怎么被坑"）时 |
 
 ### 🔟 十条最高频的坑（内联速查，全文见 PITFALLS.md）
