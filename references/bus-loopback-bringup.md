@@ -120,3 +120,50 @@ F1/F4 的 bxCAN 没有这组字段，从 bxCAN 迁到 H7 时最容易漏（`hfdc
 - 结果（ok/bad/丢帧/RPM/错误计数）**存全局，主循环心跳里周期性重打**，RTT 随时接上都能读；一次性开机日志经常在主机连上之前就滚掉了。
 - 报告只给**数字 + 判据**（`485 1→2: ok=200 bad=0；CAN tx=200 rx=200 lec=0 tec=0`），不要用“应该没问题”。
 - 全 0 收时，先给“硬件侧测点表”（VCC/VISO/A-B 差分）让用户量，而不是继续改固件——两路同时全 0 极少是代码问题。
+
+---
+
+## 5. 连续流（透明桥 / 透传）的 UART 收发：别靠 HAL 的 IT 状态机
+
+把 485 当“字节管道”（TCP↔485 透传、串口服务器）时，收发是**不间断流**，和“发一帧收一帧”的自测完全不是一回事。
+
+### 5.1 只收到第一个字节 = 接收缓冲放在栈上
+
+- 现象：每轮只收到 **1 个字节**（偶尔 3 个）就再无数据；复位后又只收一个。
+- 根因：`HAL_UART_Receive_IT(h, &局部变量, 1)` 把**栈地址**交给了 HAL 当接收缓冲；在回调里再用同样写法“续挂”，缓冲指向已失效的栈帧，
+  而且回调内重入时 HAL 的 `RxState` 判断返回 `HAL_BUSY` —— 接收链就此断掉。
+- 最小修：接收缓冲必须是**常驻**的（放进通道结构体，`uint8_t rxb`），回调里读 `RDR` 入环，再用常驻地址续挂。
+
+### 5.2 更稳的做法：寄存器级 RXNE / TXE
+
+连续流直接用寄存器，不碰 HAL 的 IT 状态机：
+
+```c
+/* 初始化：清错误，再单独开 RXNE 中断 */
+USARTx->ICR = USART_ICR_PECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_ORECF;  /* H7 是 NECF */
+USARTx->CR1 |= USART_CR1_RXNEIE;
+
+/* ISR */
+if (isr & (USART_ISR_ORE|USART_ISR_FE|USART_ISR_NE|USART_ISR_PE)) 清 ICR;   /* 不清就永久锁死接收 */
+if (isr & USART_ISR_RXNE_RXFNE) { b = (uint8_t)USARTx->RDR; ring_put(&rx, b); }
+if (isr & USART_ISR_TXE_TXFNF)  { if (pos < len) USARTx->TDR = buf[pos++]; else { CR1 &= ~TXEIE; done = 1; } }
+```
+
+要点：
+- H7 的位名是 `USART_ISR_RXNE_RXFNE` / `USART_ISR_TXE_TXFNF`（不是 `TXE_TXFNE`，拼错直接编译失败但很容易照抄错）。
+- 发送只能开 `TXEIE`，**不能一开中断就发完就撒手**：全部字节塞进 TDR 后仍要等 `USART_ISR.TC` 才拉低 DE（见第 1 节），
+  否则最后 1~2 字节被截断——DMA 的 `TxCplt` 回调也不等于 TC。
+- 环形缓冲用 2 的幂容量 + 掩码，单生产者（ISR）/单消费者（主循环）不需要加锁。
+
+### 5.3 桥的分层：ISR 只入环，搬运全在主循环
+
+`ISR/回调 → 环形缓冲 → 主循环（lwIP poll 同一圈）→ 对端`。TCP 的 recv 回调里只做“拷进 tx 环 + `tcp_recved`”，真正的 UART 发送和 TCP 发送都由主循环推进。
+这样两个方向的阻塞（TCP 窗口满、UART 正忙）都不会卡在中断里。
+
+### 5.4 自测方法（不需要第二个设备）
+
+板上两路 485 短接（A-A、B-B），两端各开一个 TCP 客户端（每路一个端口），从一端写入的字节应从另一端原样读出：
+- 只回 1~3 字节 ⇒ 接收链断（本节 5.1/5.2）；
+- 完全不回 ⇒ 先按第 1 节查 DE/收发器；
+- 回得对但慢 ⇒ 查是否把搬运挂在慢节拍上（与 lwIP 轮询同理，见 PITFALLS #101）。
+

@@ -148,10 +148,12 @@ void eth_rx_setup(void) {                    /* HAL_ETH_Start() 之后调一次 
 ```
 
 取帧：判 `DESC3 & OWN` → `len = DESC3 & 0x3FFF` → `pbuf_take` 拷出 → 重挂该条并把 `DMACRDTPR` 指向它。
+初始化阶段**绝不能边挂边推 tail**：DMA 会在中途开始取，结果是 desc0 空着、desc1/2 各压一帧，而索引一直停在 `OWN=1` 的那条 —— 看起来像"描述符里明明有帧，却永远读不到"。
 
 - 错误位是**写回格式**的名字：`ETH_DMARXNDESCWBF_CE / _RWT / _OE`（写 `ETH_DMARXNDESCRF_CE` 编译直接报不存在）；`BUF1V` 是 `0x0100_0000`。
 - **不要每秒重写 `DMACRCR.SR` 当"强启动"**：会搅乱尾指针与 DMA 状态机、把真实状态盖掉（本轮排查里就把现场弄浑过一次）。
-- 这条路在本项目里编译过、跑过启动流程，但最后一环（PC ping 通）因 SWD 失联未闭环；**用之前先跑 3.1 的回环测试确认帧进了描述符**，再对比 HAL 路径与自管路径的计数。
+- 这条路**已端到端验证**：ping 8/8、RTT 1~2ms、TCP 回显字节一致、吞吐 366KB/s（≈3Mbps，单缓冲轮询的上限）。用之前先跑 3.1 的回环测试确认帧进得了描述符。
+- **同一个工程里只留一条取帧通路**：只要还留着任何一处 `HAL_ETH_ReadData`（哪怕是开机诊断、哪怕是"顺手测一下 PHY 回环"），它就会按自己的零拷贝池重挂描述符、改写 `RxBuildDescIdx`，把自管索引打乱 —— 症状是"回环测试能收到帧、正式收包恒 0"。诊断函数要么删掉，要么改成直接读描述符。
 
 ### 3.4 其它判据
 
@@ -171,7 +173,7 @@ Cube 包里自带完整模板：`Projects/<board>/Applications/LwIP/LwIP_TCP_Ech
 
 - 只编 `src/core`、`src/core/ipv4`、`src/netif`；**include 必须加 `Middlewares/Third_Party/LwIP/system`**（里面有 `arch/cc.h`），否则一上来就 `fatal error: arch/cc.h: No such file`。
 - 初始化顺序：`lwip_init()` → `netif_add(&gnetif,&ip,&mask,&gw,NULL,ethernetif_init,ethernet_input)` → `netif_set_default` → `netif_set_up`。
-- 主循环每轮：`ethernetif_input(&gnetif)` + `sys_check_timeouts()`。
+- 主循环每轮：`ethernetif_input(&gnetif)` + `sys_check_timeouts()`。**轮询绝不能挂在 500ms 的 UI/上报节拍里**——实测往返延迟就等于 500ms、吞吐 1.5KB/s；挪到每圈后 RTT 1~2ms、366KB/s。刷屏这类慢操作（软件 SPI 整屏 2.7s）必须与 poll 解耦，否则刷屏期间网络完全停摆。
 - **HAL v1.13 的 ETH 接口**：
   - 收：`HAL_ETH_ReadData(&heth, &app)` + 实现 `HAL_ETH_RxAllocateCallback(uint8_t **buff)` 提供缓冲；
   - 发：`ETH_BufferTypeDef` + `ETH_TxPacketConfigTypeDef`（`Attributes=ETH_TX_PACKETS_FEATURES_CRCPAD`、`TxBuffer`）+ `HAL_ETH_Transmit(&heth,&cfg,timeout)`；
