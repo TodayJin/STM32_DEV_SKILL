@@ -2655,15 +2655,20 @@ def _elf_load_info(elf):
     for line in out.splitlines():
         p = line.split()
         # LOAD 0x000000 0x08000000 0x08000000 0x05f40 0x05f40 R E 0x10000
+        #   p[2]=VirtAddr p[3]=PhysAddr(LMA) p[4]=FileSiz p[5]=MemSiz
         if p and p[0] == "LOAD" and len(p) >= 6:
             try:
-                segs.append((int(p[3], 16), int(p[4], 16)))
+                lma, filesz = int(p[3], 16), int(p[4], 16)
             except ValueError:
                 continue
+            if filesz <= 0:          # .bss/.noinit/.eth_dma 等 NOLOAD 段: 不占镜像
+                continue
+            segs.append((lma, filesz))
     if not segs:
         return None
     base = min(a for a, _ in segs)
-    end = max(a + s for a, s in segs)
+    # 只统计与最低地址同一区域(16MB 内)的段, 避免把 0x24000000 的 AXI SRAM 段算进来
+    end = max(a + s for a, s in segs if a - base < 0x1000000)
     return base, end - base
 
 
@@ -2690,30 +2695,43 @@ def _verify_prepare(args, elf=None):
         print("ERROR: objcopy 失败: %s" % e)
         return None
     try:
-        data = open(tmp_bin, "rb").read()[:size]
+        data = open(tmp_bin, "rb").read()      # objcopy 产物长度即镜像真实长度
     except OSError as e:
         print("ERROR: 读 %s 失败: %s" % (tmp_bin, e))
         return None
     return (elf, base, len(data), data)
 
 
-def _verify_compare(args, elf, base, data, b, how=""):
-    """公共比对: 本地镜像 vs 从板子读回的那串字节。两边读回通道(官方 CLI / OpenOCD)都走这里。"""
+def _image_diff(data, b):
+    """逐字节比对, 但把 objcopy 的空隙填充(0x00) vs Flash 擦除态(0xFF) 视为非差异。
+    返回 (真实差异下标列表, 填充差异个数)。"""
     n = min(len(data), len(b))
     diffs = [i for i in range(n) if data[i] != b[i]]
-    ok = (not diffs) and len(data) == len(b)
-    jset(elf=elf, base=base, size=len(data), diff_bytes=len(diffs), match=ok, via=how)
+    pad = [i for i in diffs if data[i] == 0x00 and b[i] == 0xFF]
+    real = [i for i in diffs if not (data[i] == 0x00 and b[i] == 0xFF)]
+    return real, len(pad)
+
+
+def _verify_compare(args, elf, base, data, b, how=""):
+    """公共比对: 本地镜像 vs 从板子读回的那串字节。两边读回通道(官方 CLI / OpenOCD)都走这里。"""
+    real, pad = _image_diff(data, b)
+    ok = (not real) and len(data) == len(b)
+    jset(elf=elf, base=base, size=len(data), diff_bytes=len(real), pad_bytes=pad, match=ok, via=how)
     if ok:
-        print("VERIFY OK: 板子固件与 %s 完全一致。" % os.path.basename(elf))
+        if pad:
+            print("VERIFY OK: 板子固件与 %s 一致 (忽略 %d 字节 objcopy 空隙填充 0x00 vs Flash 0xFF)。"
+                  % (os.path.basename(elf), pad))
+        else:
+            print("VERIFY OK: 板子固件与 %s 完全一致。" % os.path.basename(elf))
         return 0
     print("!! VERIFY FAIL: 板子上的固件和 %s 不一样。" % os.path.basename(elf))
     print("   ---- 这就是坑#9(板子在跑旧固件), 先别查代码, 先把烧录搞对 ----")
     if len(data) != len(b):
         print("   长度不一致: ELF %d vs 板子 %d" % (len(data), len(b)))
-    print("   不同字节: %d / %d" % (len(diffs), n))
-    for i in diffs[:5]:
+    print("   不同字节: %d / %d (另有 %d 字节填充差异已忽略)" % (len(real), min(len(data), len(b)), pad))
+    for i in real[:5]:
         print("   0x%08X: ELF=0x%02X 板子=0x%02X" % (base + i, data[i], b[i]))
-    if len(diffs) > 5:
+    if len(real) > 5:
         print("   ...")
     print("   -> 重新烧: %s %s flash --elf %s" % (sys.executable or "python", os.path.abspath(__file__), elf))
     return 1
@@ -2878,33 +2896,29 @@ def cmd_verify(args):
     except Exception as e:
         print("ERROR: objcopy 失败: %s" % e)
         return 1
+    try:
+        size = os.path.getsize(tmp_bin)      # 以 objcopy 实际产物为准(NOLOAD 段不计入)
+    except OSError:
+        pass
     print("ELF 镜像: base=0x%08X size=%d -> 读回板子 Flash 比对..." % (base, size))
-    out = run_jlink_script(dev, ["savebin %s 0x%08X 0x%X" % (tmp_flash.replace("\\", "/"), base, size),
-                                 "q"], timeout=max(60, size // 1024))
+    # 目标运行中 J-Link 可能报 "Could not read memory"(实测), 先 halt 再 dump, 完事 resume
+    out = run_jlink_script(dev, ["h",
+                                 "savebin %s 0x%08X 0x%X" % (tmp_flash.replace("\\", "/"), base, size),
+                                 "g", "q"], timeout=max(60, size // 1024))
     if "O.K." not in out:
         print(out[-800:])
         print("ERROR: 读回 Flash 失败。")
         return 1
     a = open(tmp_bin, "rb").read()
     b = open(tmp_flash, "rb").read()
-    if len(a) != len(b):
-        print("!! 长度不一致: ELF %d vs 板子 %d (ELF 可能只烧了一部分?)" % (len(a), len(b)))
-    n = min(len(a), len(b))
-    diffs = [i for i in range(n) if a[i] != b[i]]
-    jset(elf=elf, base=base, size=size, diff_bytes=len(diffs), match=(not diffs and len(a) == len(b)))
-    match = (not diffs) and (len(a) == len(b))
-    if match:
-        print("VERIFY OK: 板子固件与 %s 完全一致。" % os.path.basename(elf))
-    else:
-        print("VERIFY FAIL: 共 %d 字节不同(前 3 处: %s)" %
-              (len(diffs), ", ".join("+0x%X" % d for d in diffs[:3])))
-        print("  -> 板子跑的很可能是旧固件(坑#9): 重新 make && make flash 后再验。")
-    for f in (tmp_bin, tmp_flash):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
-    return 0 if match else 1
+    try:
+        return _verify_compare(args, elf, base, a, b, how="J-Link")
+    finally:
+        for f in (tmp_bin, tmp_flash):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def cmd_reset(args):
@@ -3328,14 +3342,20 @@ def _do_verify(elf, dev):
         subprocess.run([objcopy, "-O", "binary", elf, tmp_bin], capture_output=True, timeout=60, check=True)
     except Exception as e:
         return None, "无法校验(objcopy 失败: %s)" % e
-    out = run_jlink_script(dev, ["savebin %s 0x%08X 0x%X" % (tmp_flash.replace("\\", "/"), base, size), "q"],
-                           timeout=max(60, size // 1024))
+    try:
+        size = os.path.getsize(tmp_bin)   # 以 objcopy 实际产物为准(NOLOAD 段不计入)
+    except OSError:
+        pass
+    # 目标运行中 J-Link 可能报 "Could not read memory"(实测), 先 halt 再 dump
+    out = run_jlink_script(dev, ["h",
+                                 "savebin %s 0x%08X 0x%X" % (tmp_flash.replace("\\", "/"), base, size),
+                                 "g", "q"], timeout=max(60, size // 1024))
     if "O.K." not in out:
         return None, "无法校验(读回板子 Flash 失败)"
     a = open(tmp_bin, "rb").read()
     b = open(tmp_flash, "rb").read()
-    n = min(len(a), len(b))
-    diffs = sum(1 for i in range(n) if a[i] != b[i]) + abs(len(a) - len(b))
+    real, _pad = _image_diff(a, b)
+    diffs = len(real) + abs(len(a) - len(b))
     for f in (tmp_bin, tmp_flash):
         try:
             os.remove(f)
@@ -5042,8 +5062,11 @@ _README_TPL = """# @@TARGET@@
 编译用的是本地 Cube 包: @@CUBE@@
 """
 
+# 注意: .cmd 模板必须是纯 ASCII。cmd.exe 按当前代码页解析批处理, UTF-8 中文注释
+# 在 GBK 代码页下会被拆行/当成命令执行(实测报 "... is not recognized")。
 _RUNCMD_TPL = """@echo off
-rem 由 stm32-dev 技能生成: 让 Makefile 能直接调技能(路径含空格也用引号包好了)
+rem Generated by stm32-dev skill. Keep this file ASCII-only: cmd.exe decodes it
+rem with the active code page, and UTF-8 comments can break batch parsing.
 "@@PYTHON@@" "@@SKILL@@" %*
 """
 

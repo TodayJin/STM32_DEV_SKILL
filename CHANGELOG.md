@@ -1,5 +1,19 @@
 # Changelog — stm32-dev 技能
 
+## 3.29.0 (2026-10-23) —— 外设驱动必须先查手册（位定义/满量程）+ verify 误报三处修复
+
+- **#112** 外设写命令必须逐位对照数据手册：MCP4728 数据字节错位一个半字节，把 `AVREF/PD1/PD0/GAIN` 写进数据位（写 4095 时芯片进掉电模式）。**读回正确 ≠ 输出正确**（读回的是 input register）。
+- **#113** 满量程/增益必须由原理图反馈网络反算：PDH-1 的 ADJ 按 `Vout=41.75−17.86×Vdac` 设计，DAC 满量程只需 2.048 V（GAIN=0）；改成 ×2 后高码值目标为负、低压段失控。
+- SKILL.md 新增 **0.1 写外设驱动前必须先查手册（硬规则）**，preflight 人工清单加两条。
+- 修复 `_elf_load_info`：把 `FileSiz=0` 的 NOLOAD 段（AXI SRAM @0x24000000）也算进镜像范围，导致 verify 去读 448 MB、报"长度不一致"。
+- 修复 verify 的两条假报警：① 目标运行中 J-Link 可能 `Could not read memory` → 读回前 `h`（halt）、读完 `g`；② objcopy 空隙填充 0x00 vs Flash 擦除态 0xFF 不再算差异。
+- 修复 `new/setup` 生成的 `tools/stm32-dev-run.cmd`：注释必须是纯 ASCII，中文注释在 GBK 代码页的 cmd.exe 下会被拆行/误执行（实测 `'...' is not recognized`）。
+
+## 3.28.2 (2026-10-23) —— LVGL 拖动/遮罩/刷新实测经验（references 更新，补登）
+
+- `references/lvgl-on-mcu.md`：遮罩命中不看透明度 → 拖动期间 `remove_flag(CLICKABLE)` + `PRESS_LOCK`；点击抑制用时间窗不用粘滞布尔；每 100 ms 的状态不变量只允许"往关的方向"自愈；遮罩透明度不要逐帧写（`set_style_*` 每次 refresh+invalidate 整屏）→ 固定值或 2~3 档；帧率别用 flush 次数（分带会重复计数）。
+- `references/small-peripheral-recipes.md`：补充小外设配方。
+
 ## 3.27.0 (2026-10-23) —— 三份独立审计后补充：LVGL 命中/按压语义、HAL I2C 死锁、GT911 状态字
 
 - **#109** 透明浮层照样吃点击；拖动中显示浮层会触发 PRESS_LOST → 用 PRESS_LOCK + 拖动期间取消 CLICKABLE；点击抑制用时间窗不要用粘滞标志。
