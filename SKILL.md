@@ -7,14 +7,14 @@ description: |
   观测手段分层（串口探针帧/RTT 上行/RTT 下行/DWT 打点/故障现场转储/黑匣子）、**开工前对照检查
   （`preflight`：拿技能里的结论把现有工程扫一遍，机械项自动判、判不了的列人工清单）**、
   空项目脚手架（`new`：自动搭 Makefile 工程 + 按调试器配好）、串口观测（`serial`）、27 个命令、
-  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（105 条实战坑）与 PRACTICES.md（工程实践手册：
+  --json 输出；附录 OBSERVE.md（观测手段）PITFALLS.md（108 条实战坑）与 PRACTICES.md（工程实践手册：
   上电时序 / 协议从站 / 控制与标定 / 状态灯 / 台架测试分层 / 上位机 / 工程流程 / 硬件板级 / 多轴差异）、
   PROBES.md（三种调试器各自的坑 / 可用工具 / 最强用法 / 降级路径）、SETUP.md（工具链怎么装、装在哪）。
   适用前提：已有 GNU Make/CMake 工程，或用 `new` 现场生成；不负责 Keil/CubeIDE 工程生成
   （那属于 stm32-development-workflow）。
 metadata:
   author: EricSun
-  version: 3.26.6
+  version: 3.26.7
   date: "2026-10-22"
 ---
 
@@ -67,7 +67,7 @@ metadata:
 | 🔬 观测手段分层 | 选哪种观测通道 + 通用集成法（RTT/DWT/故障转储/黑匣子） |
 | ①~⑨ 各阶段 | 具体命令（doctor/make/flash/read/rtt/blackbox…） |
 | 📋 案例复盘 | "串口收不到"一整天：错误的排查路径 |
-| 📚 附录 | `OBSERVE.md` 观测手段 / `PITFALLS.md` 102 条坑 / `PRACTICES.md` 工程实践手册（见文末） |
+| 📚 附录 | `OBSERVE.md` 观测手段 / `PITFALLS.md` 108 条坑 / `PRACTICES.md` 工程实践手册（见文末） |
 
 ---
 
@@ -189,6 +189,8 @@ python3 scripts/netlist_pins.py board.tel --net PC4 PC5 PA7  # 反查：这几�
 - **“慢”先算理论下界再改**：`传输时间 = 字节数 × 8 / 时钟`。实测≈理论 = 时钟受限，去提时钟；实测远大于理论 = 每帧开销受限（CS 翻转、HAL 每次调用约 10µs），应加大每帧字节数或改寄存器直写（见 `references/spi-lcd-bringup.md` 第 8 节）。只看到“慢”就去换时钟，等于白改一轮；
 - **只能靠用户的眼睛验收时，一轮只问一个问题**：屏/机械动作这类没有仪表可读的目标，每轮烧录只回答一个是非（“有字/没字”“分界在中间/不在”），并在同一轮里把结果存成全局变量。**但显示类问题更优先：能 dump 就不要问**——把帧缓冲/绘制缓冲用 J-Link `savebin` 读出来转 PNG 自己看（`references/lvgl-on-mcu.md` 第九节），能直接区分“LVGL 没画”与“画了没送上屏”，比让用户描述快一个量级。**连续两轮出现退步就立刻回退到最近一版可用的构建，再决定下一步**；第三次换方案前先问自己“上一个方案为什么不行、证据是什么”——每轮都是用户的一次上电和注意力，靠“再试一种写法”攒运气只会把可用状态也弄丢；
 - **用户说「别测了，你自己查代码」时，立刻停止烧录试探**：改为静态读代码（初始化顺序/状态机标志/父子对象层级）+ 固件自报（RTT 计数、`nm` 现查地址读全局、dump 帧缓冲转图），烧录只留给最终验证。一轮轮烧给用户看，是这类任务里最贵的浪费。
+- **交互层（点击/手势/切页/弹层）的修复，交付前必须自己把回归跑绿，不要把用户当测试机**：用合成输入 + 页面编号 + 状态遥测自动跑「点卡片→进详情→返回→再点」「拖抽屉→关→再点」「进子页→点返回→回首页」三条路径（做法见 `references/lvgl-on-mcu.md` 10.9）。这三条覆盖了绝大多数"点了没反应"——尤其是遮罩残留、输入卡在 PRESSED、点击回调里做重活这三类。**没跑过就说「改好了」，下一轮用户复现出来的还是同一类问题。**
+- **同一个交互 bug 已经烧了 2~3 轮还没定住，就换手段，而不是再改一版试试**：并行起 2~3 个独立 subagent 做只读审计（事件/状态机一个、驱动/总线一个、内存与 API 误用一个），它们上下文干净、不会带着你上一轮的假设。让它们返回「文件:行号 + 根因 + 最小改法」，你负责合并、落地、再用上一条的回归脚本验证。自己写的代码自己找根因容易陷入盲区；用户的耐心不该花在你重复同一个猜测上。
 - 怀疑观测 → 换探针帧(不用调试器)。
 
 **时钟/看门狗是最容易"把调试口一起搞死"的一类改动，按上面同一条铁律单独改**：
@@ -527,13 +529,13 @@ make flash             # 重烧
 | `SETUP.md` | **工具链怎么装**：CubeCLT / STM32CubeProgrammer / OpenOCD / pyOCD / Cube 固件包 / 驱动 | 新机器、缺工具、探针认不出来时 |
 | `references/h743-hal-bringup.md` | **H743 裸机工程 bring-up**：`new` 内存参数、接 Cube HAL（Makefile/conf/按需模块）、时钟树单独一次改（480MHz 顺序与 PLL 取值）、无时钟⇒SWD 失联与 BOOT0 救砖、不用外设的时钟/时基验收、**假硬件 + RTT 断言自测** | 新工程 bring-up、要先把逻辑跑通、调试口连不上时 |
 | `references/spi-display-touch-bringup.md` | **SPI 彩屏 + 电容触摸全套**：CS 粒度阶梯与提速顺序、**SPI DMA 提速（必配 SPIx 中断 + AXI 缓冲，否则卡死；实测整屏 47ms/整页 193ms）**、MADCTL 四向自检、行缓冲按最大宽度开、**裁剪用运行时宽高**、整字一次 DMA、局部重刷、背光时序、**GT911 读点后必清 0x814E（不清就永远返回同一个点）**、**幽灵触点锁死（空闲时点计数在涨+坐标恒定 → 双清 + 重跑复位时序）**、厂家 `.cfg` 配置写入、两点靶点标定 + 标定存 Flash、沿触发点击（**pressed 标志在所有松手路径上都要清**）、卖家多压缩包先列全再解压、标定带配置版本、**先做 sys_api 接口层再排布局** | 点带触摸的 SPI 屏、“坐标不变/触摸没反应”、只能点第一次、刷新率不够、要改 UI 布局时 |
-| `references/lvgl-on-mcu.md` | **LVGL v9 上 MCU**：v8→v9 接口对照表、**flush 必须拷到独立 DMA 缓冲再交换字节（就地改 `px_map` 会「只有边框没文字」）**、**双缓冲异步 flush（`flush_ready` 只能在 DMA 完成中断里调；弱符号漏定义会死锁在 `wait_for_flushing`）**、**blit 整区域一次 DMA（逐行等 DMA = 160ms/屏）**、三个必调参数（**栈 16KB** / 堆放 AXI 用 `LV_MEM_ADR` / 显式 `LV_COLOR_FORMAT_RGB565`）、Makefile 用递归 `wildcard`（不能用 `$(shell find)`）、**中文字模必须 `--no-compress`（否则字变实心方块）+ 改文案后用 `scripts/lvgl_font_subset_check.py` 验缺字**、**用 J-Link dump 帧缓冲转 PNG 自己验收画面**、按 JSON 规格稿绝对坐标实现界面的工作流、**刷新迟滞与带宽↔帧率上限**、**单个 label 超宽导致每帧重排（flush 区域反复刷同一小块）**、**开机顺序：屏/LVGL 要排在网络与板测之前**、**全屏遮罩吞点击 / 手势抽屉闪退 / 屏幕滚动条**、**抽屉跟手（PRESSING + `lv_indev_get_vect`，可中途反悔）与首页隐退**、**零拷贝字节序 `LV_COLOR_FORMAT_RGB565_SWAPPED`（切换后必须 dump 复核，异常即回退）**、**`make` 报 `Nothing to be done` 时烧的是旧固件（比对 .bin 大小）**、**开机渐显渐隐动画**、**设置页真实控件（PWM 亮度/Slider+Toggle/空闲熄屏）与 Flash 持久化（32 字节对齐）**、**点击回调里建屏/切页会吃掉松手事件 → 之后所有点击（含返回）失效（界面预建；★ 别在 CLICKED 里用 lv_indev_wait_release，会把输入永久锁死）** | 要在 MCU 上 GUI 框架、花屏/卡在 `lv_text_*`/只有边框没文字/中文方块、点卡片没反应或抽屉一闪就没、点几下就全失效、开机屏亮得晚、链接 RAM 溢出、按设计稿排多页面时 |
+| `references/lvgl-on-mcu.md` | **LVGL v9 上 MCU**：v8→v9 接口对照表、**flush 必须拷到独立 DMA 缓冲再交换字节（就地改 `px_map` 会「只有边框没文字」）**、**双缓冲异步 flush（`flush_ready` 只能在 DMA 完成中断里调；弱符号漏定义会死锁在 `wait_for_flushing`）**、**blit 整区域一次 DMA（逐行等 DMA = 160ms/屏）**、三个必调参数（**栈 16KB** / 堆放 AXI 用 `LV_MEM_ADR` / 显式 `LV_COLOR_FORMAT_RGB565`）、Makefile 用递归 `wildcard`（不能用 `$(shell find)`）、**中文字模必须 `--no-compress`（否则字变实心方块）+ 改文案后用 `scripts/lvgl_font_subset_check.py` 验缺字**、**用 J-Link dump 帧缓冲转 PNG 自己验收画面**、按 JSON 规格稿绝对坐标实现界面的工作流、**刷新迟滞与带宽↔帧率上限**、**单个 label 超宽导致每帧重排（flush 区域反复刷同一小块）**、**开机顺序：屏/LVGL 要排在网络与板测之前**、**全屏遮罩吞点击 / 手势抽屉闪退 / 屏幕滚动条**、**抽屉跟手（PRESSING + `lv_indev_get_vect`，可中途反悔）与首页隐退**、**零拷贝字节序 `LV_COLOR_FORMAT_RGB565_SWAPPED`（切换后必须 dump 复核，异常即回退）**、**`make` 报 `Nothing to be done` 时烧的是旧固件（比对 .bin 大小）**、**开机渐显渐隐动画**、**设置页真实控件（PWM 亮度/Slider+Toggle/空闲熄屏）与 Flash 持久化（32 字节对齐）**、**点击回调里建屏/切页会吃掉松手事件 → 之后所有点击（含返回）失效（界面预建；★ 别在 CLICKED 里用 lv_indev_wait_release，会把输入永久锁死）**、**用户不在场时的输入自测三件套（合成输入注入 / RAM 事件环形日志 / 页面编号全局；调试开关用完必须回写 0，否则固件忽略真实触摸、看着像硬件坏）** | 要在 MCU 上 GUI 框架、花屏/卡在 `lv_text_*`/只有边框没文字/中文方块、点卡片没反应或抽屉一闪就没、点几下就全失效、开机屏亮得晚、链接 RAM 溢出、按设计稿排多页面时 |
 | `references/spi-lcd-bringup.md` | **4 线 SPI 小屏 bring-up**：ST7789P3 原厂初始化表（0xD0 双写、D6=A1、per-byte CS）、ST7789 各子型号差异、1LINE 释放 MISO、分色带/上红下蓝自检、**无 MISO 不能读回显存**、帧长/CS 粒度阶梯与提速下界 | 点一块 SPI TFT、屏幕全黑/花屏/变慢时 |
 | `references/bus-loopback-bringup.md` | **通信口 bring-up**：RS485/CAN 两路对打（接线、DE 与 TC 时序、直流驱动测试、序号+校验判据）、隔离收发器上电测点、**FDCAN 先做内部回环**、**收不到时的寄存器签名**（UART PE/NF/ORE=RX 悬空；FDCAN 消息 RAM 元素数为 0 ⇒ FIFO 长度 0，TEC=0 且 TXFQS 自由槽位 0；FDCANSEL 默认 HSE 的坑；TXFQS/CCCR 等偏移以 CMSIS struct 为准）、以太网“先交换层后协议栈”分层 | 新板第一次验 485/CAN/网口、或“发得出去收不到”时 |
 | `references/h7-eth-lwip-bringup.md` | **H7 以太网 bring-up（RMII PHY → MAC/DMA → lwIP 裸机）**：MDIO 位翻转读 ID/BMSR 与采样偏移、**描述符/缓冲必须放 AXI SRAM（DTCM DMA 访问不到，症状是 SR 自清、RX 恒 0）**、MSP 引脚表按网表重写、`HAL_ETH_Start` 不可漏、**RMII/MII 模式位（`SYSCFG->PMCR.EPIS_SEL`，读 PMCR 注意偏移 0x04）**、广播/混杂过滤（ARP 是广播）、HAL v1.13 的 ReadData/Transmit 接口、静态 IP 与 APIPA 169.254/16、Windows 防火墙不拦入站 ICMP 的误判、**REF_CLK 边沿探针与 PHY 内部回环（BMCR bit14）组成的四步 RX 判据** | 第一次点网口、PHY link 亮但 ping 不通、lwIP 收不到帧时（也含 Windows 三种 ping 回显 / “网络不可达”= 本机无路由，需给网卡加副地址） |
 | `references/small-peripheral-recipes.md` | **小幅外设配方**：有源蜂鸣器（非阻塞单次短鸣）、4 线风扇（25kHz PWM + TACH EXTI + RPM 公式与实测单调性）、背光/EN 上电安全态、TIM 需要的 HAL 模块 | 接蜂鸣器/风扇/背光、或“先测一下这个小器件”时 |
 | `references/h7-flash-and-halt-triage.md` | **含 `Failed to initialize DAP` 分诊**（应用侧判活 → 多档速度 → BOOT0，而不是先怀疑固件） | **烧录路径与“卡死”三分诊断**：烧 bin 不烧 hex（全零字节丢失导致 verify 报个别字节不同）、烧完必须 `r`+`g`、CFSR/时基/`g_boot_stage` 三招区分 HardFault 与 HAL 超时、探针速率怎么定 | 烧完“没生效”、RTT 抓不到、看着像死机、SWD 连不上时 |
-| `PITFALLS.md` | **105 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
+| `PITFALLS.md` | **108 条实战踩坑**（含按主题索引） | **遇到怪现象先搜它**；开工前扫一遍标题 |
 | `PRACTICES.md` | **工程实践手册**：上电与初始化时序 / 从站与总线协议实现清单 / 控制·标定·夹持判定 / 状态灯与现场可观测性 / 台架测试分层 / 上位机与 SDK / 工程流程 / 硬件板级 / 多轴差异清单 | **新板 bring-up 前、写协议或标定模块前、收尾前**；想知道"怎么做对"（不是"怎么被坑"）时 |
 
 ### 🔟 十条最高频的坑（内联速查，全文见 PITFALLS.md）
@@ -577,7 +579,7 @@ stm32-dev/
 ├── PROBES.md           (附录: 三种调试器 —— 能力/注意事项/可用工具/最强用法/降级路径)
 ├── SETUP.md            (附录: 工具链怎么装 + 驱动 + 环境变量)
 ├── OBSERVE.md          (附录: 观测手段分层 + 通用集成法)
-├── PITFALLS.md         (附录: 102 条实战坑 + 主题索引)
+├── PITFALLS.md         (附录: 108 条实战坑 + 主题索引)
 ├── PRACTICES.md        (附录: 工程实践手册 —— 上电时序/协议从站/控制与标定/状态灯/台架/上位机/流程/硬件板级)
 ├── CHANGELOG.md        (版本演进)
 └── scripts/
