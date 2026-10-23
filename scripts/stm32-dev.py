@@ -1753,7 +1753,17 @@ def cmd_flash(args):
         )
         out = (r.stdout or "") + (r.stderr or "")
         print(out[-1500:])
-        if "O.K." in out or "Downloading file" in out:
+        # ★ 不能拿 "O.K." 当成功判据: J-Link 只要连上**探针**就会打印
+        #   "Connecting to J-Link ...O.K."，目标连不上时同样会出现 —— 曾导致
+        #   "DAP 初始化失败却报 FLASH OK"，板子实际还是旧固件(坑#9 的变种)。
+        _fail = ("Could not connect", "Failed to initialize DAP", "InitTarget() returned with error",
+                 "Error occurred:", "Could not read memory", "Programming failed", "Failed to erase")
+        _hit = next((m for m in _fail if m in out), None)
+        if _hit:
+            print("!! FLASH 失败: %s" % _hit)
+            print("   -> 先查 SWD 排线/目标供电/复位脚; 换探针或降速重试。别把上面的 O.K. 当成功。")
+            rc = 1
+        elif "Script processing completed" in out and ("Downloading" in out or "O.K." in out):
             print("FLASH OK: %s -> %s" % (hexfile, dev))
             jset(flashed=True, hex=hexfile, device=dev)
             rc = 0
