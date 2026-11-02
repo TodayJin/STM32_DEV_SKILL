@@ -4838,24 +4838,21 @@ def _gcc_prefix():
     return "arm-none-eabi-"
 
 
-_MAKEFILE_TPL = """# @@TARGET@@ -- 由 stm32-dev 技能生成的最小可烧录工程(裸机 + CMSIS, 不依赖 HAL)
+_MAKEFILE_TPL = """# @@TARGET@@ -- 由 stm32-dev 技能生成的工程骨架(裸机 + CMSIS, 不依赖 HAL)
 # 芯片: @@DEVICE@@   调试器配置: .stm32-dev.json(改调试器: stm32-dev.py probe use)
-# 内核参数: @@CPU@@ @@FPU@@ @@ABI@@  (按 CMSIS 设备头自动判定; 单精度核如 F722 把 fpv5-d16 改成 fpv5-sp-d16)
+# 目录:
+#   src/       业务源码(分层: app / bsp / drivers / middleware)
+#   external/  厂商 CMSIS 头 + 启动文件 + system 源(已复制进工程, 不依赖 Cube 安装路径)
+#   config/    链接脚本等配置
+#   tools/     技能包装脚本
+#   build/     编译产物
+# 内核参数: @@CPU@@ @@FPU@@ @@ABI@@ (按 CMSIS 设备头自动判定)
 
 TARGET   := @@TARGET@@
 DEVICE   := @@DEVICE@@
 DEFS     := -D@@STEM_UPPER@@
-CUBE     := @@CUBE@@
-CUBE_INC := @@CUBE_INC@@
-CORE_INC := @@CORE_INC@@
-STARTUP  := @@STARTUP@@
-SYS_SRC  := @@SYS_SRC@@
-# 烧录/调试走技能脚本。默认用 PATH 里的 python + 生成时记下的技能路径;
-# 换机器/换解释器/技能搬了位置, 用命令行覆盖即可: make flash PYTHON=py STM32DEV=...
-PYTHON   ?= python
-STM32DEV ?= @@RUN@@
-RUN      := "$(PYTHON)" "$(STM32DEV)"
 
+EXT      := external
 BUILD    := build
 PREFIX   := @@PREFIX@@
 CC       := $(PREFIX)gcc
@@ -4864,10 +4861,24 @@ OBJCOPY  := $(PREFIX)objcopy
 SIZE     := $(PREFIX)size
 
 COREFLAGS := @@CPU@@ @@FPU@@ @@ABI@@
-CFLAGS    := $(COREFLAGS) -O2 -g3 -Wall -ffunction-sections -fdata-sections $(DEFS) -I$(CUBE_INC) -I$(CORE_INC) -I.
-LDFLAGS   := $(COREFLAGS) -Tlinker.ld -Wl,-Map=$(BUILD)/$(TARGET).map,--cref -Wl,--gc-sections -specs=nano.specs -specs=nosys.specs
+CFLAGS    := $(COREFLAGS) -O2 -g3 -Wall -ffunction-sections -fdata-sections $(DEFS) \\
+             -I$(EXT)/cmsis -I$(EXT)/device -Isrc
+LDFLAGS   := $(COREFLAGS) -Tconfig/linker.ld -Wl,-Map=$(BUILD)/$(TARGET).map,--cref \\
+             -Wl,--gc-sections -specs=nano.specs -specs=nosys.specs
 
-OBJS := $(BUILD)/main.o $(BUILD)/@@SYS_OBJ@@ $(BUILD)/@@STARTUP_OBJ@@
+SYS_SRC  := $(EXT)/system/@@SYS_NAME@@
+STARTUP  := $(EXT)/startup/@@STARTUP_NAME@@
+
+SRCS := $(wildcard src/*.c) $(wildcard src/*/*.c)
+OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS)) \\
+        $(BUILD)/@@SYS_OBJ@@ $(BUILD)/@@STARTUP_OBJ@@
+
+# 烧录/调试走技能脚本; 换机器/换解释器: make flash PYTHON=py STM32DEV=...
+PYTHON   ?= python
+STM32DEV ?= @@RUN@@
+RUN      := "$(PYTHON)" "$(STM32DEV)"
+
+SUBDIRS := $(BUILD)/app $(BUILD)/bsp $(BUILD)/drivers $(BUILD)/middleware
 
 .PHONY: all clean flash verify reset size doctor probe
 all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).hex $(BUILD)/$(TARGET).bin
@@ -4875,7 +4886,10 @@ all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).hex $(BUILD)/$(TARGET).bin
 $(BUILD):
 	-mkdir $(BUILD)
 
-$(BUILD)/main.o: main.c | $(BUILD)
+$(SUBDIRS):
+	-mkdir $@
+
+$(BUILD)/%.o: src/%.c | $(BUILD) $(SUBDIRS)
 	$(CC) -c $(CFLAGS) $< -o $@
 
 $(BUILD)/@@SYS_OBJ@@: $(SYS_SRC) | $(BUILD)
@@ -5036,30 +5050,43 @@ SECTIONS
 }
 """
 
-_MAIN_TPL = """/* @@TARGET@@ -- 由 stm32-dev 技能生成的最小 main.c
+_MAIN_TPL = """/* @@TARGET@@ -- 由 stm32-dev 技能生成的入口(main)
  *
- * 这里只有内核级代码(任何 STM32 都能编过); 点灯/串口/CAN 等外设按你的板子自己加。
- * 调试建议: 全局计数器就是最便宜的"探针", 读它就知道程序在不在跑:
+ * 分层约定:
+ *   src/app/        应用逻辑
+ *   src/bsp/        板级支持(时钟/GPIO/外设初始化)
+ *   src/drivers/    器件驱动
+ *   src/middleware/ 协议栈/中间件
+ * 调试建议: app/app.c 里的 g_tick 就是最便宜的"探针":
  *     stm32-dev.py read g_tick
  */
 #include "@@DEV_HEADER@@"
-
-volatile uint32_t g_tick  = 0;              /* 每轮循环 +1 */
-volatile uint32_t g_magic = 0x5A5A0000u;
+#include "app/app.h"
+#include "bsp/bsp.h"
 
 int main(void)
 {
-    g_magic = 0x5A5A0001u;
+    bsp_init();
+    app_init();
     while (1) {
-        g_tick++;
-        for (volatile uint32_t i = 0; i < 100000u; i++) { }   /* 粗延时 */
+        app_loop();
     }
 }
 """
 
 _README_TPL = """# @@TARGET@@
 
-由 stm32-dev 技能生成的最小工程(裸机 + CMSIS 官方启动文件, 不依赖 HAL)。
+由 stm32-dev 技能生成的工程骨架(裸机 + CMSIS, 不依赖 HAL)。
+
+## 目录
+
+- src/        源码(分层: main / app / bsp / drivers / middleware)
+- external/   厂商 CMSIS 头、启动文件、system 源(已复制进工程, 不依赖本机 Cube 路径)
+- config/     链接脚本等配置
+- tools/      技能包装脚本
+- build/      编译产物(make 生成)
+
+## 常用命令
 
 - 编译: make
 - 烧录并校验: make flash
@@ -5069,7 +5096,64 @@ _README_TPL = """# @@TARGET@@
 
 芯片: @@DEVICE@@; 调试器写在 .stm32-dev.json(技能每次命令都会自动读它)。
 内存参数: FLASH=@@FLASH@@ RAM=@@RAM@@ (@@MEM_SRC@@) —— 请对照数据手册确认。
-编译用的是本地 Cube 包: @@CUBE@@
+"""
+
+_APP_H_TPL = """#ifndef APP_H
+#define APP_H
+
+#include <stdint.h>
+
+void app_init(void);
+void app_loop(void);
+
+extern volatile uint32_t g_tick;
+extern volatile uint32_t g_magic;
+
+#endif /* APP_H */
+"""
+
+_APP_C_TPL = """#include "app/app.h"
+
+volatile uint32_t g_tick  = 0;              /* 每轮循环 +1 */
+volatile uint32_t g_magic = 0x5A5A0000u;
+
+void app_init(void)
+{
+    g_magic = 0x5A5A0001u;
+}
+
+void app_loop(void)
+{
+    g_tick++;
+    for (volatile uint32_t i = 0; i < 100000u; i++) { }   /* 粗延时, 占位 */
+}
+"""
+
+_BSP_H_TPL = """#ifndef BSP_H
+#define BSP_H
+
+void bsp_init(void);
+
+#endif /* BSP_H */
+"""
+
+_BSP_C_TPL = """#include "bsp/bsp.h"
+
+/* 板级初始化(时钟/GPIO/外设)按你的板子在这里加 */
+void bsp_init(void)
+{
+}
+"""
+
+_SRC_README_TPL = """# src 分层
+
+- main.c        入口: 调 bsp_init()/app_init(), 然后跑 app_loop()
+- app/          应用层(业务逻辑)
+- bsp/          板级支持包(时钟/GPIO/外设初始化)
+- drivers/      器件/外设驱动
+- middleware/   协议栈、中间件、第三方库
+
+新增 .c 会被 Makefile 自动收集(wildcard src/*.c + src/*/*.c)。
 """
 
 # 注意: .cmd 模板必须是纯 ASCII。cmd.exe 按当前代码页解析批处理, UTF-8 中文注释
@@ -5084,6 +5168,18 @@ _RUNSH_TPL = """#!/bin/sh
 # 由 stm32-dev 技能生成
 exec "@@PYTHON@@" "@@SKILL@@" "$@"
 """
+
+
+def _copy_external(root, layout, startup):
+    """把 CMSIS 头/启动文件/system 源复制进工程, 让工程自包含(不依赖 Cube 路径)。"""
+    dst = os.path.join(root, "external")
+    os.makedirs(dst, exist_ok=True)
+    shutil.copytree(layout["core_inc"], os.path.join(dst, "cmsis"), dirs_exist_ok=True)
+    shutil.copytree(layout["dev_inc"], os.path.join(dst, "device"), dirs_exist_ok=True)
+    for sub, src in (("startup", startup), ("system", layout["system"])):
+        d = os.path.join(dst, sub)
+        os.makedirs(d, exist_ok=True)
+        shutil.copy2(src, os.path.join(d, os.path.basename(src)))
 
 
 def cmd_new(args):
@@ -5144,22 +5240,27 @@ def cmd_new(args):
     files["Makefile"] = (_MAKEFILE_TPL
                          .replace("@@TARGET@@", name).replace("@@DEVICE@@", device)
                          .replace("@@STEM_UPPER@@", _stem_define(stem))
-                         .replace("@@CUBE@@", pack.replace("\\", "/"))
-                         .replace("@@CUBE_INC@@", layout["dev_inc"].replace("\\", "/"))
-                         .replace("@@CORE_INC@@", layout["core_inc"].replace("\\", "/"))
-                         .replace("@@STARTUP@@", startup.replace("\\", "/"))
-                         .replace("@@SYS_SRC@@", layout["system"].replace("\\", "/"))
+                         .replace("@@SYS_NAME@@", os.path.basename(layout["system"]))
+                         .replace("@@STARTUP_NAME@@", os.path.basename(startup))
                          .replace("@@SYS_OBJ@@", os.path.basename(layout["system"])[:-2] + ".o")
                          .replace("@@STARTUP_OBJ@@", os.path.basename(startup)[:-2] + ".o")
                          .replace("@@PREFIX@@", prefix)
                          .replace("@@RUN@@", os.path.abspath(__file__).replace("\\", "/"))
                          .replace("@@CPU@@", cpu).replace("@@FPU@@", mfpu).replace("@@ABI@@", abi))
-    files["linker.ld"] = (_LD_TPL.replace("@@TARGET@@", name).replace("@@FLASH@@", flash)
-                          .replace("@@RAM@@", ram).replace("@@MEM_SRC@@", mem_src))
-    files["main.c"] = _MAIN_TPL.replace("@@TARGET@@", name).replace("@@DEV_HEADER@@", stem + ".h")
+    files[os.path.join("config", "linker.ld")] = (_LD_TPL.replace("@@TARGET@@", name).replace("@@FLASH@@", flash)
+                         .replace("@@RAM@@", ram).replace("@@MEM_SRC@@", mem_src))
+    files[os.path.join("src", "main.c")] = (_MAIN_TPL.replace("@@TARGET@@", name)
+                         .replace("@@DEV_HEADER@@", stem + ".h"))
+    files[os.path.join("src", "app", "app.c")] = _APP_C_TPL
+    files[os.path.join("src", "app", "app.h")] = _APP_H_TPL
+    files[os.path.join("src", "bsp", "bsp.c")] = _BSP_C_TPL
+    files[os.path.join("src", "bsp", "bsp.h")] = _BSP_H_TPL
+    files[os.path.join("src", "README.md")] = _SRC_README_TPL
+    files[os.path.join("src", "drivers", ".gitkeep")] = ""
+    files[os.path.join("src", "middleware", ".gitkeep")] = ""
     files["README.md"] = (_README_TPL.replace("@@TARGET@@", name).replace("@@DEVICE@@", device)
-                          .replace("@@FLASH@@", flash).replace("@@RAM@@", ram)
-                          .replace("@@MEM_SRC@@", mem_src).replace("@@CUBE@@", pack))
+                         .replace("@@FLASH@@", flash).replace("@@RAM@@", ram)
+                         .replace("@@MEM_SRC@@", mem_src))
     files[".gitignore"] = "build/\n"
     tools_dir = os.path.join(root, "tools")
     runner = "stm32-dev-run" + (".cmd" if os.name == "nt" else ".sh")
@@ -5172,11 +5273,13 @@ def cmd_new(args):
             print("ERROR: 这些文件已存在, 不覆盖: %s" % ", ".join(clash))
             print("  -> 确认要重写就加 --force")
             return 1
+    _copy_external(root, layout, startup)
+    print("  外部依赖: external/ (CMSIS + 启动文件 + system)")
     os.makedirs(tools_dir, exist_ok=True)
     for fn, txt in files.items():
         p = os.path.join(root, fn)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", newline="\n") as fh:
+        with open(p, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(txt)
         print("  + %s" % fn)
     kind = probe_for_work(verbose=False)

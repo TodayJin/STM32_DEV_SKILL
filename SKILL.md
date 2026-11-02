@@ -105,12 +105,22 @@ metadata:
 "$SKILL/scripts/stm32-dev.py" probe info stlink      # 这台调试器的能力/注意事项/最强用法/降级路径
 "$SKILL/scripts/stm32-dev.py" setup --fix            # 一键体检 + 能自动补的直接补(写探针配置 / pip 装 pyserial·pyocd)
 "$SKILL/scripts/stm32-dev.py" setup --install        # 还缺编译器/openocd 时连系统包也自动装(winget/apt)
-"$SKILL/scripts/stm32-dev.py" new --dir . --device STM32G431CBT6   # 空文件夹 -> 能直接 make/flash 的最小工程
+"$SKILL/scripts/stm32-dev.py" new --dir . --device STM32G431CBT6   # 空文件夹 -> 分层工程骨架(能直接 make/flash)
 ```
 
 **目录是空的、或只有几个 `.c` 还没有构建系统时：这一步不用问用户，技能自己把工程搭起来。**
-`new --dir . --device <型号> [--probe <探针>]` 会把 CMSIS 头、官方启动文件、内存参数、`Makefile`、链接脚本（含
-`.noinit`）、`main.c` 骨架、`.stm32-dev.json` 一次配好；**搭完立刻 `make` 编一次**确认能出 `.elf`，再往下走 ①～⑨。
+`new --dir . --device <型号> [--probe <探针>]` 生成一套**分层工程骨架**（目录固定，业务代码不要堆在根目录）：
+
+    <工程>/
+    ├── Makefile            构建 + flash/verify/reset/doctor（烧录走技能脚本）
+    ├── config/linker.ld    链接脚本（含 .noinit 黑匣子段）
+    ├── external/           厂商 CMSIS 头 + 启动文件 + system 源（复制进工程，不依赖本机 Cube 路径）
+    ├── src/                业务源码：main.c + app/ bsp/ drivers/ middleware/
+    ├── tools/              技能包装脚本
+    ├── build/              编译产物（.gitignore）
+    └── .stm32-dev.json     调试器/芯片配置（probe use 写入）
+
+新增 `.c` 会被 Makefile 自动收集（`src/*.c` + `src/*/*.c`）；**搭完立刻 `make` 编一次**确认能出 `.elf`，再往下走 ①～⑨。
 型号写不全（比如只写 `STM32G431`）技能会自己补全封装/容量；芯片系列认不出来才会反问用户。
 
 **不用记这些**：插上哪个调试器技能就自动用哪个；配一次（写进工程）之后所有命令都走对的那条路。

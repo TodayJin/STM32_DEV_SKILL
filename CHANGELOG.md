@@ -1,5 +1,12 @@
 # Changelog — stm32-dev 技能
 
+## 3.30.0 (2026-11-02) —— new 改为分层工程骨架：src/external/config/tools/build + UTF-8
+
+- `new` 生成的工程改为固定分层：`src/`（main.c + app/、bsp/、drivers/、middleware/）、`external/`（CMSIS 头、启动文件、system 源**复制进工程**，不再依赖本机 Cube 路径）、`config/linker.ld`、`tools/`、`build/`。
+- Makefile 自动收集 `src/*.c` + `src/*/*.c`，编译/链接参数全部用 `external/`、`config/` 相对路径，工程可整体拷走。
+- 新增 `app/`、`bsp/` 最小占位骨架（含 g_tick/g_magic 探针），`drivers/`、`middleware/` 留空目录；README 说明分层。
+- 生成文件统一 **UTF-8** 写出（之前是 Windows 默认 GBK，跨平台/编辑器会乱码）。
+
 ## 3.29.0 (2026-10-23) —— 外设驱动必须先查手册（位定义/满量程）+ verify 误报三处修复
 
 - **#112** 外设写命令必须逐位对照数据手册：MCP4728 数据字节错位一个半字节，把 `AVREF/PD1/PD0/GAIN` 写进数据位（写 4095 时芯片进掉电模式）。**读回正确 ≠ 输出正确**（读回的是 input register）。
