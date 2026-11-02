@@ -4862,7 +4862,7 @@ SIZE     := $(PREFIX)size
 
 COREFLAGS := @@CPU@@ @@FPU@@ @@ABI@@
 CFLAGS    := $(COREFLAGS) -O2 -g3 -Wall -ffunction-sections -fdata-sections $(DEFS) \\
-             -I$(EXT)/cmsis -I$(EXT)/device -Isrc
+             -I$(EXT)/cmsis -I$(EXT)/device -I$(EXT)/drivers/inc -Isrc
 LDFLAGS   := $(COREFLAGS) -Tconfig/linker.ld -Wl,-Map=$(BUILD)/$(TARGET).map,--cref \\
              -Wl,--gc-sections -specs=nano.specs -specs=nosys.specs
 
@@ -4870,7 +4870,9 @@ SYS_SRC  := $(EXT)/system/@@SYS_NAME@@
 STARTUP  := $(EXT)/startup/@@STARTUP_NAME@@
 
 SRCS := $(wildcard src/*.c) $(wildcard src/*/*.c)
+DRV_SRCS := $(wildcard $(EXT)/drivers/src/*.c)
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS)) \\
+        $(patsubst $(EXT)/drivers/src/%.c,$(BUILD)/ext_drivers/%.o,$(DRV_SRCS)) \
         $(BUILD)/@@SYS_OBJ@@ $(BUILD)/@@STARTUP_OBJ@@
 
 # 烧录/调试走技能脚本; 换机器/换解释器: make flash PYTHON=py STM32DEV=...
@@ -4878,7 +4880,7 @@ PYTHON   ?= python
 STM32DEV ?= @@RUN@@
 RUN      := "$(PYTHON)" "$(STM32DEV)"
 
-SUBDIRS := $(BUILD)/app $(BUILD)/bsp $(BUILD)/drivers $(BUILD)/middleware
+SUBDIRS := $(BUILD)/app $(BUILD)/bsp $(BUILD)/drivers $(BUILD)/middleware $(BUILD)/ext_drivers
 
 .PHONY: all clean flash verify reset size doctor probe
 all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).hex $(BUILD)/$(TARGET).bin
@@ -4886,10 +4888,13 @@ all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).hex $(BUILD)/$(TARGET).bin
 $(BUILD):
 	-mkdir $(BUILD)
 
-$(SUBDIRS):
+$(SUBDIRS): | $(BUILD)
 	-mkdir $@
 
 $(BUILD)/%.o: src/%.c | $(BUILD) $(SUBDIRS)
+	$(CC) -c $(CFLAGS) $< -o $@
+
+$(BUILD)/ext_drivers/%.o: $(EXT)/drivers/src/%.c | $(BUILD) $(SUBDIRS)
 	$(CC) -c $(CFLAGS) $< -o $@
 
 $(BUILD)/@@SYS_OBJ@@: $(SYS_SRC) | $(BUILD)
@@ -5182,6 +5187,187 @@ def _copy_external(root, layout, startup):
         shutil.copy2(src, os.path.join(d, os.path.basename(src)))
 
 
+_AT32_LIB_DIRS = ("AT32F402_405_Firmware_Library",)
+_AT32_DEFS = {"AT32F405": "AT32F405xx", "AT32F402": "AT32F402xx"}
+
+
+def _find_at32_lib(explicit=None):
+    """找 AT32F402_405 固件库根目录(含 libraries/cmsis/cm4/device_support)。"""
+    cands = []
+    if explicit:
+        cands.append(explicit)
+    env = os.environ.get("AT32_FW_PATH")
+    if env:
+        cands.append(env)
+    for d in ("", os.path.expanduser("~"), "C:/", "D:/"):
+        for name in _AT32_LIB_DIRS:
+            cands.append(os.path.join(d, name) if d else name)
+    for c in cands:
+        ds = os.path.join(c, "libraries", "cmsis", "cm4", "device_support")
+        if c and os.path.isfile(os.path.join(ds, "at32f402_405.h")):
+            return os.path.abspath(c)
+    return None
+
+
+def _at32_mem(lib, device):
+    """从 Artery 官方 ldscripts 抄 FLASH/RAM 大小; 找不到返回 (None, None)。"""
+    family = device.upper()[:8]
+    ld_dir = os.path.join(lib, "project", "at_start_f405", "templates", "at32_ide", "ldscripts")
+    code = device.upper()[9] if len(device) > 9 else "C"
+    cands = []
+    for pat in ("AT32F405x%s_FLASH.ld" % code, "AT32F405*_FLASH.ld", "*.ld"):
+        cands = sorted(glob.glob(os.path.join(ld_dir, pat)))
+        if cands:
+            break
+    for p in cands:
+        try:
+            txt = open(p, errors="replace").read()
+        except OSError:
+            continue
+        fl = re.search(r"FLASH\s*\([^)]*\)\s*:\s*ORIGIN\s*=\s*[^,]+,\s*LENGTH\s*=\s*([0-9]+[KMG]?)", txt, re.I)
+        rm = re.search(r"RAM\s*\([^)]*\)\s*:\s*ORIGIN\s*=\s*[^,]+,\s*LENGTH\s*=\s*([0-9]+[KMG]?)", txt, re.I)
+        if fl and rm:
+            return fl.group(1).upper(), rm.group(1).upper()
+    return None, None
+
+
+def _cmd_new_at32(args, root, name, device):
+    """AT32F402/405 分支: 用 Artery 官方固件库生成同样的分层工程骨架。"""
+    dev = device.upper()
+    family = dev[:8]
+    if family not in _AT32_DEFS:
+        print("ERROR: 目前只支持 AT32F402 / AT32F405 系列, 收到 %s" % device)
+        return 1
+    lib = _find_at32_lib(getattr(args, "at32_lib", None))
+    if not lib:
+        print("ERROR: 没找到 AT32F402_405 固件库(需要 CMSIS 设备头 + 启动文件 + system 源)。")
+        print("  获取: git clone https://gitee.com/arterytek/AT32F402_405_Firmware_Library.git")
+        print("  然后: set AT32_FW_PATH=<库根目录>   或   new --at32-lib <库根目录>")
+        return 1
+    ds = os.path.join(lib, "libraries", "cmsis", "cm4", "device_support")
+    cs = os.path.join(lib, "libraries", "cmsis", "cm4", "core_support")
+    startup = os.path.join(ds, "startup", "gcc", "startup_at32f402_405.s")
+    system = os.path.join(ds, "system_at32f402_405.c")
+    header = "at32f402_405.h"
+    for p in (os.path.join(ds, header), startup, system):
+        if not os.path.isfile(p):
+            print("ERROR: 固件库文件缺失: %s" % p)
+            return 1
+    print("  AT32 库: %s" % lib)
+    print("  启动文件: %s" % os.path.basename(startup))
+    flash, ram = _at32_mem(lib, device)
+    mem_src = "抄自 Artery 官方 ldscripts"
+    if not flash or not ram:
+        flash, ram = "256K", "96K"
+        mem_src = "AT32F405 默认值(请对照手册确认)"
+    if args.flash:
+        flash = args.flash
+        mem_src = "--flash 指定"
+    if args.ram:
+        ram = args.ram
+        mem_src = "--ram 指定"
+    print("  内存: FLASH=%s RAM=%s" % (flash, ram))
+    defs = dev
+    skill = os.path.abspath(__file__)
+    python = sys.executable or "python"
+    prefix = _gcc_prefix()
+    cpu, mfpu, abi = ("-mcpu=cortex-m4", "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard")
+    files = {}
+    files["Makefile"] = (_MAKEFILE_TPL
+                         .replace("@@TARGET@@", name).replace("@@DEVICE@@", device)
+                         .replace("@@STEM_UPPER@@", defs)
+                         .replace("@@SYS_NAME@@", os.path.basename(system))
+                         .replace("@@STARTUP_NAME@@", os.path.basename(startup))
+                         .replace("@@SYS_OBJ@@", os.path.basename(system)[:-2] + ".o")
+                         .replace("@@STARTUP_OBJ@@", os.path.basename(startup)[:-2] + ".o")
+                         .replace("@@PREFIX@@", prefix)
+                         .replace("@@RUN@@", os.path.abspath(__file__).replace("\\", "/"))
+                         .replace("@@CPU@@", cpu).replace("@@FPU@@", mfpu).replace("@@ABI@@", abi))
+    files[os.path.join("config", "linker.ld")] = (_LD_TPL.replace("@@TARGET@@", name)
+                         .replace("@@FLASH@@", flash).replace("@@RAM@@", ram)
+                         .replace("@@MEM_SRC@@", mem_src))
+    files[os.path.join("src", "main.c")] = (_MAIN_TPL.replace("@@TARGET@@", name)
+                         .replace("@@DEV_HEADER@@", header))
+    files[os.path.join("src", "app", "app.c")] = _APP_C_TPL
+    files[os.path.join("src", "app", "app.h")] = _APP_H_TPL
+    files[os.path.join("src", "bsp", "bsp.c")] = _BSP_C_TPL
+    files[os.path.join("src", "bsp", "bsp.h")] = _BSP_H_TPL
+    files[os.path.join("src", "README.md")] = _SRC_README_TPL
+    files[os.path.join("src", "drivers", ".gitkeep")] = ""
+    files[os.path.join("src", "middleware", ".gitkeep")] = ""
+    files["README.md"] = (_README_TPL.replace("@@TARGET@@", name).replace("@@DEVICE@@", device)
+                         .replace("@@FLASH@@", flash).replace("@@RAM@@", ram)
+                         .replace("@@MEM_SRC@@", mem_src))
+    files[".gitignore"] = "build/\n"
+    runner = "stm32-dev-run" + (".cmd" if os.name == "nt" else ".sh")
+    files[os.path.join("tools", runner)] = (
+        (_RUNCMD_TPL if os.name == "nt" else _RUNSH_TPL)
+        .replace("@@PYTHON@@", python).replace("@@SKILL@@", skill))
+    if not args.force:
+        clash = [fn for fn in files if os.path.isfile(os.path.join(root, fn))]
+        if clash:
+            print("ERROR: 这些文件已存在, 不覆盖: %s" % ", ".join(clash))
+            print("  -> 确认要重写就加 --force")
+            return 1
+    ext = os.path.join(root, "external")
+    os.makedirs(os.path.join(ext, "cmsis"), exist_ok=True)
+    os.makedirs(os.path.join(ext, "device"), exist_ok=True)
+    os.makedirs(os.path.join(ext, "startup"), exist_ok=True)
+    os.makedirs(os.path.join(ext, "system"), exist_ok=True)
+    shutil.copytree(cs, os.path.join(ext, "cmsis"), dirs_exist_ok=True)
+    for fn in os.listdir(ds):
+        if fn.lower().endswith(".h"):
+            shutil.copy2(os.path.join(ds, fn), os.path.join(ext, "device", fn))
+    shutil.copy2(startup, os.path.join(ext, "startup", os.path.basename(startup)))
+    shutil.copy2(system, os.path.join(ext, "system", os.path.basename(system)))
+    drv_inc = os.path.join(lib, "libraries", "drivers", "inc")
+    if os.path.isdir(drv_inc):
+        shutil.copytree(drv_inc, os.path.join(ext, "drivers", "inc"), dirs_exist_ok=True)
+    drv_src = os.path.join(lib, "libraries", "drivers", "src")
+    if os.path.isdir(drv_src):
+        shutil.copytree(drv_src, os.path.join(ext, "drivers", "src"), dirs_exist_ok=True)
+    conf_tpl = os.path.join(ds, "at32f402_405_conf_template.h")
+    if os.path.isfile(conf_tpl):
+        shutil.copy2(conf_tpl, os.path.join(ext, "device", "at32f402_405_conf.h"))
+    for fn, txt in files.items():
+        p = os.path.join(root, fn)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(txt)
+        print("  + %s" % fn)
+    print("  + external/ (CMSIS + 设备头 + 启动文件 + system)")
+    kind = probe_for_work(verbose=False)
+    if kind:
+        cfg = load_config(root)
+        cfg["probe"] = kind
+        if _SERIAL and _SERIAL != DEFAULT_SERIAL:
+            cfg["serial"] = _SERIAL
+        save_config(cfg, root)
+        print("  + .stm32-dev.json (调试器: %s)" % kind)
+    else:
+        print("  [提醒] 现在没探测到调试器 -> 插好后跑: stm32-dev.py probe use <jlink|stlink|daplink>")
+    if args.no_build:
+        print("跳过编译(--no-build)。下一步: cd %s && make" % root)
+        return 0
+    mk = _make_exe()
+    print("=== 编译验证: %s -j4 ===" % mk)
+    try:
+        r = subprocess.run([mk, "-j4"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    except Exception as e:
+        print("ERROR: 跑 make 失败: %s" % e)
+        return 1
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out[-1500:])
+    if r.returncode != 0:
+        print("!! 编译失败。把上面这段发我, 或用 --flash/--ram 覆盖内存参数。")
+        return 1
+    elf = os.path.join(root, "build", name + ".elf")
+    print("OK: 工程生成 + 编译通过 -> %s" % elf)
+    print("下一步: cd %s && make flash" % root)
+    jset(project=root, device=device, elf=elf, probe=kind or None, flash=flash, ram=ram)
+    return 0
+
+
 def cmd_new(args):
     """空项目脚手架: 生成能直接 make / 烧录 / 调试的最小工程。
 
@@ -5191,6 +5377,8 @@ def cmd_new(args):
     name = args.name or re.sub(r"[^0-9A-Za-z_]", "_", os.path.basename(root) or "firmware")
     device = resolve_device(args, None)
     print("=== 生成工程: %s (芯片 %s) ===" % (root, device))
+    if device.upper().startswith("AT32"):
+        return _cmd_new_at32(args, root, name, device)
     pack = find_cube_pack(device, args.verbose)
     if not pack:
         key5 = _dev_key(device)[5:]
@@ -5937,6 +6125,7 @@ def build_parser():
     s.add_argument("--name", default=None, help="工程名(默认=目录名)")
     s.add_argument("--flash", default=None, help="Flash 大小(如 128K); 默认抄 ST 官方链接脚本")
     s.add_argument("--ram", default=None, help="RAM 大小(如 32K); 拿不到时必须给")
+    s.add_argument("--at32-lib", default=None, dest="at32_lib", help="AT32F402/405 固件库根目录(默认读环境变量 AT32_FW_PATH / 常见路径)")
     s.add_argument("--force", action="store_true", help="覆盖已存在的文件")
     s.add_argument("--no-build", action="store_true", dest="no_build", help="只生成, 不编译验证")
     s.add_argument("--verbose", action="store_true")

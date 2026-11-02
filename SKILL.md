@@ -106,6 +106,7 @@ metadata:
 "$SKILL/scripts/stm32-dev.py" setup --fix            # 一键体检 + 能自动补的直接补(写探针配置 / pip 装 pyserial·pyocd)
 "$SKILL/scripts/stm32-dev.py" setup --install        # 还缺编译器/openocd 时连系统包也自动装(winget/apt)
 "$SKILL/scripts/stm32-dev.py" new --dir . --device STM32G431CBT6   # 空文件夹 -> 分层工程骨架(能直接 make/flash)
+"$SKILL/scripts/stm32-dev.py" new --dir . --device AT32F405CCT7 --at32-lib <AT32F402_405 固件库>  # AT32 同理
 ```
 
 **目录是空的、或只有几个 `.c` 还没有构建系统时：这一步不用问用户，技能自己把工程搭起来。**
@@ -121,6 +122,10 @@ metadata:
     └── .stm32-dev.json     调试器/芯片配置（probe use 写入）
 
 新增 `.c` 会被 Makefile 自动收集（`src/*.c` + `src/*/*.c`）；**搭完立刻 `make` 编一次**确认能出 `.elf`，再往下走 ①～⑨。
+
+**支持两种芯片来源**：
+- **STM32**：自动从本机 STM32Cube 包取 CMSIS/启动文件/system（找不到就提示装哪个包）；
+- **AT32F402/405**（雅特力）：需要 [AT32F402_405 固件库](https://gitee.com/arterytek/AT32F402_405_Firmware_Library)，用 `--at32-lib <库根目录>` 或环境变量 `AT32_FW_PATH` 指定；生成时把 CMSIS、设备头（`at32f402_405.h/def.h/conf.h`）、启动文件、system 源、`drivers/inc`、`drivers/src` 复制进 `external/`，Makefile 自动编译 `external/drivers/src`，并按精确型号（如 `AT32F405CCT7`）加 `-D`。
 型号写不全（比如只写 `STM32G431`）技能会自己补全封装/容量；芯片系列认不出来才会反问用户。
 
 **不用记这些**：插上哪个调试器技能就自动用哪个；配一次（写进工程）之后所有命令都走对的那条路。

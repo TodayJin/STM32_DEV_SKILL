@@ -1,5 +1,12 @@
 # Changelog — stm32-dev 技能
 
+## 3.31.0 (2026-11-02) —— new 支持 AT32F402/405（Artery 固件库）
+
+- `new --device AT32F405CCT7` 走 Artery 分支：自动查找 AT32F402_405 固件库（`--at32-lib` / 环境变量 `AT32_FW_PATH` / 常见路径），把 CMSIS 头、设备头（`at32f402_405.h/def.h/conf.h`）、启动文件、system 源、`drivers/inc`、`drivers/src` 复制进工程的 `external/`。
+- Makefile 增加 `external/drivers/src/*.c` 编译（对象进 `build/ext_drivers/`），AT32 用精确型号宏（如 `-DAT32F405CCT7`）；AT32F405 默认 256K Flash / 96K RAM（从官方 ldscripts 抄）。
+- 修 `$(SUBDIRS)` 的父目录依赖：首次并行 make 时 `build/app` 可能先于 `build` 创建导致 `mkdir` 失败。
+- 实测：AT32F405CCT7 生成 + `make` + `make clean && make` 通过（text≈1KB）；STM32G431CBT6 生成 + `make` 回归通过。
+
 ## 3.30.0 (2026-11-02) —— new 改为分层工程骨架：src/external/config/tools/build + UTF-8
 
 - `new` 生成的工程改为固定分层：`src/`（main.c + app/、bsp/、drivers/、middleware/）、`external/`（CMSIS 头、启动文件、system 源**复制进工程**，不再依赖本机 Cube 路径）、`config/linker.ld`、`tools/`、`build/`。
